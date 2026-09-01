@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import requests
@@ -109,8 +110,14 @@ class AzoraFlyAdapter(HtmlLatestAdapter):
         title = clean_text(headings[-1]) if headings else work_key.rsplit("/", 1)[-1].replace("-", " ")
         summary_node = soup.select_one("meta[name='description']")
         summary = summary_node.get("content") if summary_node else None
-        cover_node = soup.select_one("meta[property='og:image']")
-        cover_url = cover_node.get("content") if cover_node else None
+        # Azora's og:image is a generated SEO preview endpoint and is not a
+        # stable copy of the actual series cover. The original storage URL is
+        # exposed in JSON-LD and in the rendered cover image, so prefer those
+        # values and only use og:image as a last-resort fallback.
+        cover_url = self._extract_original_cover(soup)
+        if not cover_url:
+            cover_node = soup.select_one("meta[property='og:image']")
+            cover_url = cover_node.get("content") if cover_node else None
         chapters: list[SourceChapterSnapshot] = []
         seen: set[str] = set()
         for chapter_link in soup.select('a[href*="/chapter-"]'):
@@ -140,6 +147,79 @@ class AzoraFlyAdapter(HtmlLatestAdapter):
             chapters=tuple(chapters),
             payload={"detail_url": source_url},
         )
+
+    @classmethod
+    def _extract_original_cover(cls, soup: BeautifulSoup) -> str | None:
+        """Extract Azora's original cover instead of its generated og image."""
+        structured_items: list[dict] = []
+        referenced_images: list[str] = []
+
+        for script in soup.select("script[type='application/ld+json']"):
+            try:
+                payload = json.loads(script.string or script.get_text())
+            except (TypeError, ValueError):
+                continue
+
+            if isinstance(payload, dict) and isinstance(payload.get("@graph"), list):
+                structured_items.extend(
+                    item for item in payload["@graph"] if isinstance(item, dict)
+                )
+            elif isinstance(payload, dict):
+                structured_items.append(payload)
+
+        # WebPage.primaryImageOfPage and Article.image normally point to the
+        # ImageObject that contains the actual storage URL.
+        for item in structured_items:
+            for field in ("primaryImageOfPage", "image"):
+                value = item.get(field)
+                if isinstance(value, str):
+                    referenced_images.append(value.strip())
+                elif isinstance(value, dict):
+                    for key in ("@id", "url"):
+                        reference = value.get(key)
+                        if isinstance(reference, str) and reference.strip():
+                            referenced_images.append(reference.strip())
+
+        images_by_id = {
+            str(item.get("@id")).strip(): item
+            for item in structured_items
+            if item.get("@id")
+        }
+        for reference in referenced_images:
+            item = images_by_id.get(reference)
+            candidate = item.get("url") if item else reference
+            usable = cls._usable_cover_url(candidate)
+            if usable:
+                return usable
+
+        # Fallback for pages that expose an ImageObject without a reference.
+        for item in structured_items:
+            item_type = item.get("@type")
+            types = item_type if isinstance(item_type, list) else [item_type]
+            if "ImageObject" not in types:
+                continue
+            usable = cls._usable_cover_url(item.get("url"))
+            if usable:
+                return usable
+
+        # The current page also renders the same original URL in the cover
+        # image itself. Keep this as a second non-SEO fallback for theme
+        # changes that remove JSON-LD but retain the visible cover.
+        for image in soup.select("img[alt^='Cover of '], img[alt='Background']"):
+            candidate = image.get("data-src") or image.get("data-lazy-src") or image.get("src")
+            usable = cls._usable_cover_url(candidate)
+            if usable:
+                return usable
+        return None
+
+    @staticmethod
+    def _usable_cover_url(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value or value.startswith("data:") or "/api/og-image/" in value:
+            return None
+        return value
 
     def fetch_pages(self, chapter: SourceChapterSnapshot) -> tuple[SourcePageSnapshot, ...]:
         soup = self._get_soup(chapter.source_url)
