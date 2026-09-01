@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mangastar-multisource"
+version = "0.1.0"
+description = "Canonical multi-source manga ingestion pipeline for Manga Star"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.12,<5",
+    "PyMySQL>=1.1,<2",
+    "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+ms-multisource = "mangastar_multisource.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mangastar_multisource = ["migrations/*.sql"]
