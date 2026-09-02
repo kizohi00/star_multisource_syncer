@@ -1860,6 +1860,17 @@ class MySqlSourceRepository:
                 (series_id,),
             )
             return
+        # The legacy table can contain a stale pointer whose chapter now
+        # belongs to another series (for example after a merge). Because
+        # latest_chapter_id is globally unique, remove only that incorrect
+        # pointer before writing the verified series/chapter pair.
+        cursor.execute(
+            """
+            DELETE FROM series_latest_chapters
+            WHERE latest_chapter_id=%s AND series_id<>%s
+            """,
+            (latest["id"], series_id),
+        )
         cursor.execute(
             """
             INSERT INTO series_latest_chapters (series_id, latest_chapter_id)
