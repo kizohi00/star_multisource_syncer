@@ -9,6 +9,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+print("[mangastar-syncer] entrypoint started", flush=True)
+
 from mangastar_multisource.cli import main  # noqa: E402
 from mangastar_multisource.config import load_local_env  # noqa: E402
 

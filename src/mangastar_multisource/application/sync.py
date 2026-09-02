@@ -11,6 +11,10 @@ from ..infrastructure.repositories import MySqlSourceRepository
 from ..matching.metadata import MetadataMatcher, normalize_title
 
 
+def _log(message: str) -> None:
+    print(f"[mangastar-syncer] {message}", flush=True)
+
+
 @dataclass(frozen=True)
 class PollResult:
     source_key: str
@@ -71,12 +75,14 @@ class LatestFeedService:
         # Load only titles/aliases before network discovery. Expensive fields
         # such as summaries and chapter statistics are hydrated after we know
         # which canonical IDs are plausible candidates for this feed batch.
+        _log("poll: loading canonical series")
         canonical_series = self.repository.list_canonical_series(include_metadata=False)
         self.matcher.prepare(canonical_series)
         # Register every selected source before network work so a failed fetch
         # can always be recorded without violating the source FK.
         for adapter in adapters:
             self.repository.ensure_source(adapter.key, adapter.display_name, adapter.base_url)
+        _log(f"poll: fetching latest feeds for {len(adapters)} source(s)")
         frontiers = {
             adapter.key: self._load_frontier(adapter.key)
             for adapter in adapters
@@ -98,8 +104,13 @@ class LatestFeedService:
                 try:
                     discovery = future.result()
                     discoveries.append((adapter, discovery))
+                    _log(
+                        f"{adapter.key}: latest complete; works={len(discovery.feed.works)}; "
+                        f"pages={discovery.pages_scanned}; stop={discovery.stop_reason}"
+                    )
                 except Exception as exc:  # one broken source must not stop the other sources
                     message = f"{type(exc).__name__}: {exc}"
+                    _log(f"{adapter.key}: latest failed; {message}")
                     self.repository.mark_poll_failure(adapter.key, message)
                     results.append(PollResult(adapter.key, "failed", error=message))
             hydrate = getattr(self.repository, "hydrate_canonical_series_metadata", None)
@@ -118,9 +129,12 @@ class LatestFeedService:
                 self.matcher.prepare(canonical_series)
             for adapter, discovery in discoveries:
                 try:
+                    _log(f"{adapter.key}: persisting latest feed")
                     results.append(self._persist(adapter, discovery, canonical_series))
+                    _log(f"{adapter.key}: latest feed persisted")
                 except Exception as exc:  # one broken source must not stop the other sources
                     message = f"{type(exc).__name__}: {exc}"
+                    _log(f"{adapter.key}: latest persistence failed; {message}")
                     self.repository.mark_poll_failure(adapter.key, message)
                     results.append(PollResult(adapter.key, "failed", error=message))
             backfill_results = self._run_backfill(
@@ -199,6 +213,11 @@ class LatestFeedService:
         if not claimed:
             return results
 
+        _log(
+            "backfill: fetching "
+            + ", ".join(f"{adapter.key}/page-{page}" for adapter, page in claimed)
+        )
+
         with ThreadPoolExecutor(
             max_workers=max(1, len(claimed)),
             thread_name_prefix="source-backfill",
@@ -211,6 +230,10 @@ class LatestFeedService:
                 adapter, page = jobs[future]
                 try:
                     feed, supports_pagination = future.result()
+                    _log(
+                        f"{adapter.key}: backfill page {page} fetched; "
+                        f"works={len(feed.works)}"
+                    )
                     stop_reason = self._backfill_stop_reason(
                         feed,
                         supports_pagination=supports_pagination,
@@ -239,7 +262,12 @@ class LatestFeedService:
                         "backfill_next_page": next_page,
                         "backfill_stop_reason": stop_reason,
                     }
+                    _log(
+                        f"{adapter.key}: backfill page {page} persisted; "
+                        f"new_chapters={persisted.new_chapters}; stop={stop_reason}"
+                    )
                 except Exception as exc:
+                    _log(f"{adapter.key}: backfill page {page} failed; {type(exc).__name__}: {exc}")
                     self._release_backfill_page(fail_page, adapter.key, page, exc)
                     results[adapter.key] = self._backfill_failure_info(
                         page=page,
@@ -311,7 +339,9 @@ class LatestFeedService:
                 stop_reason = "max_pages"
                 break
 
+            _log(f"{adapter.key}: requesting latest page {page}")
             feed, supports_pagination = self._fetch_page(adapter, page, limit=limit)
+            _log(f"{adapter.key}: received latest page {page}; works={len(feed.works)}")
             pages_scanned = page
             page_works = [work for work in feed.works if work.source_work_key not in seen_work_keys]
             if not page_works:

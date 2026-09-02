@@ -10,6 +10,10 @@ from .enrichment import EnrichmentResult, WorkEnrichmentService
 from .sync import LatestFeedService, PollResult
 
 
+def _log(message: str) -> None:
+    print(f"[mangastar-syncer] {message}", flush=True)
+
+
 @dataclass(frozen=True)
 class WorkerCycleResult:
     started_at: datetime
@@ -64,10 +68,13 @@ class MultiSourceWorker:
 
     def run_once(self) -> WorkerCycleResult:
         started = datetime.now(timezone.utc)
+        _log("poll started")
         poll_results = tuple(self.poll_service.poll(self.adapters, limit=self.poll_limit))
+        _log(f"poll finished; source_results={len(poll_results)}")
         enrichment_results: tuple[EnrichmentResult, ...] = ()
         chapter_promotion_results: tuple[dict, ...] = ()
         if self.enrich_limit:
+            _log(f"enrichment started; limit={self.enrich_limit}")
             enrich_kwargs = {
                 "limit": self.enrich_limit,
                 "pending_only": True,
@@ -77,10 +84,12 @@ class MultiSourceWorker:
             enrichment_results = tuple(
                 self.enrichment_service.enrich(self.adapters, **enrich_kwargs)
             )
+            _log(f"enrichment finished; results={len(enrichment_results)}")
         if self.chapter_promotion_limit:
             promotion_service = getattr(self.enrichment_service, "auto_chapters", None)
             promote_pending = getattr(promotion_service, "promote_pending", None)
             if callable(promote_pending):
+                _log(f"chapter promotion started; limit={self.chapter_promotion_limit}")
                 promotion_adapters = self.fallback_adapters or self.adapters
                 chapter_promotion_results = (
                     promote_pending(
@@ -89,6 +98,8 @@ class MultiSourceWorker:
                         limit=self.chapter_promotion_limit,
                     ),
                 )
+                _log("chapter promotion finished")
+        _log("cycle finished")
         return WorkerCycleResult(
             started_at=started,
             finished_at=datetime.now(timezone.utc),

@@ -20,6 +20,11 @@ from .matching.metadata import MetadataMatcher
 MIGRATIONS = Path(__file__).resolve().parent / "migrations"
 
 
+def _log(message: str) -> None:
+    """Write an immediately visible worker status line for hosted logs."""
+    print(f"[mangastar-syncer] {message}", flush=True)
+
+
 def configure_utf8_stdio() -> None:
     """Keep JSON output usable on Windows terminals with a legacy code page."""
     for stream in (sys.stdout, sys.stderr):
@@ -94,10 +99,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     configure_utf8_stdio()
     args = build_parser().parse_args(argv)
+    if args.command == "worker":
+        _log("worker command received")
     if args.env_file is not None:
         load_local_env(args.env_file)
     settings = Settings.from_env()
     settings.validate()
+    if args.command == "worker":
+        _log("configuration validated")
     database = MySqlDatabase(settings)
     repository = MySqlSourceRepository(database)
 
@@ -181,6 +190,11 @@ def main(argv: list[str] | None = None) -> None:
     all_adapters = build_adapters(settings)
     adapters = select_adapters(all_adapters, set(args.sources or []))
     if args.command == "worker":
+        _log(
+            "worker initialized; sources="
+            + ",".join(adapter.key for adapter in adapters)
+            + f"; once={args.once}"
+        )
         poll_service = LatestFeedService(
             repository,
             MetadataMatcher(auto_threshold=settings.auto_match_threshold, margin=settings.match_margin),
@@ -220,8 +234,9 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
         if args.once:
+            _log("cycle started")
             result = worker.run_once()
-            print(json.dumps(result.as_dict(), ensure_ascii=False))
+            print(json.dumps(result.as_dict(), ensure_ascii=False), flush=True)
             if result.error or (
                 not args.allow_source_failures
                 and any(item.status == "failed" for item in result.poll_results)

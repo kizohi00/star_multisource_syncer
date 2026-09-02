@@ -1,6 +1,9 @@
 {
   "$schema": "https://schema.railpack.com",
   "deploy": {
-    "startCommand": "python run_railway.py worker --once --allow-source-failures"
+    "startCommand": "python -u run_railway.py worker --once --allow-source-failures",
+    "variables": {
+      "PYTHONUNBUFFERED": "1"
+    }
   }
 }

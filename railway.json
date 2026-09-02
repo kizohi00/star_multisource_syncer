@@ -5,9 +5,9 @@
   },
   "deploy": {
     "preDeployCommand": [
-      "python run_railway.py migrate"
+      "python -u run_railway.py migrate"
     ],
-    "startCommand": "python run_railway.py worker --once --allow-source-failures",
+    "startCommand": "python -u run_railway.py worker --once --allow-source-failures",
     "cronSchedule": "*/10 * * * *",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3

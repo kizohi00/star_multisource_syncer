@@ -11,6 +11,10 @@ from ..matching.metadata import MetadataMatcher
 from .auto_chapters import AutoChapterPromotionService
 
 
+def _log(message: str) -> None:
+    print(f"[mangastar-syncer] {message}", flush=True)
+
+
 @dataclass(frozen=True)
 class EnrichmentResult:
     source_key: str
@@ -59,6 +63,7 @@ class WorkEnrichmentService:
         pending_only: bool = False,
         fallback_adapters: Sequence[SourceAdapter] | None = None,
     ) -> list[EnrichmentResult]:
+        _log(f"enrichment: loading pending works; limit={limit}")
         canonical_series = self.repository.list_canonical_series(include_metadata=False)
         self.matcher.prepare(canonical_series)
         hydrate = getattr(self.repository, "hydrate_canonical_series_metadata", None)
@@ -74,7 +79,10 @@ class WorkEnrichmentService:
             )
 
         if not work_items:
+            _log("enrichment: no pending works")
             return []
+
+        _log(f"enrichment: queued {len(work_items)} work(s)")
 
         # Each job owns its matcher instance. The canonical objects are
         # immutable snapshots, while metadata hydration and persistence use a
@@ -121,12 +129,14 @@ class WorkEnrichmentService:
         selected_adapters: tuple[SourceAdapter, ...],
     ) -> EnrichmentResult:
         try:
+            _log(f"enrichment: fetching details for {adapter.key} work {row['id']}")
             matcher = MetadataMatcher(
                 auto_threshold=self.matcher.auto_threshold,
                 margin=self.matcher.margin,
             )
             matcher.prepare(canonical_series)
             snapshot = adapter.fetch_work_details(row["source_url"])
+            _log(f"enrichment: details fetched for {adapter.key} work {row['id']}")
             matching_series = canonical_series
             if callable(hydrate):
                 candidate_ids = matcher.candidate_ids_for_work(
@@ -180,6 +190,10 @@ class WorkEnrichmentService:
                     fallback_adapters or selected_adapters,
                 )
             chapter_links = self.repository.link_exact_chapters(source_work_id)
+            _log(
+                f"enrichment: completed {adapter.key} work {row['id']}; "
+                f"chapters={chapter_count}; linked={chapter_links['linked']}"
+            )
             return EnrichmentResult(
                 adapter.key,
                 source_work_id,
@@ -194,6 +208,7 @@ class WorkEnrichmentService:
                 fallback_chapters=int(chapter_promotion["fallbacks"]),
             )
         except Exception as exc:
+            _log(f"enrichment: failed {adapter.key} work {row['id']}; {type(exc).__name__}: {exc}")
             return EnrichmentResult(
                 adapter.key,
                 int(row["id"]),
