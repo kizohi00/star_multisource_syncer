@@ -67,6 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--source", action="append", dest="sources", help="Source key; repeat to select multiple")
     worker.add_argument("--limit", type=int, default=None, help="Maximum latest works per source")
     worker.add_argument("--enrich-limit", type=int, default=None, help="Pending works to enrich per source per cycle")
+    worker.add_argument(
+        "--promote-limit",
+        type=int,
+        default=None,
+        help="Maximum pending source chapters to publish per cycle",
+    )
     worker.add_argument("--interval", type=int, default=None, help="Seconds between cycles")
     worker.add_argument("--once", action="store_true", help="Run one cycle and exit")
     worker.add_argument("--known-streak", type=int, default=None, help="Known consecutive works required to stop paging")
@@ -205,6 +211,11 @@ def main(argv: list[str] | None = None) -> None:
             ),
             interval_seconds=args.interval or settings.poll_interval_seconds,
             fallback_adapters=all_adapters,
+            chapter_promotion_limit=(
+                settings.chapter_promotion_limit
+                if args.promote_limit is None
+                else args.promote_limit
+            ),
         )
         if args.once:
             result = worker.run_once()

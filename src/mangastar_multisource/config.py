@@ -82,6 +82,7 @@ class Settings:
     enrich_new_work_limit: int = 5
     enrichment_workers: int = 3
     page_workers: int = 3
+    chapter_promotion_limit: int = 50
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -111,6 +112,7 @@ class Settings:
             enrich_new_work_limit=_env_int("MANGA_ENRICH_NEW_WORK_LIMIT", 5),
             enrichment_workers=_env_int("MANGA_ENRICHMENT_WORKERS", 3),
             page_workers=_env_int("MANGA_PAGE_WORKERS", 3),
+            chapter_promotion_limit=_env_int("MANGA_CHAPTER_PROMOTION_LIMIT", 50),
         )
 
     def validate(self, *, require_password: bool = True) -> None:
@@ -138,6 +140,8 @@ class Settings:
             raise ValueError("MANGA_ENRICHMENT_WORKERS must be at least 1.")
         if self.page_workers < 1:
             raise ValueError("MANGA_PAGE_WORKERS must be at least 1.")
+        if self.chapter_promotion_limit < 0:
+            raise ValueError("MANGA_CHAPTER_PROMOTION_LIMIT cannot be negative.")
         if self.latest_known_streak < 1:
             raise ValueError("MANGA_LATEST_KNOWN_STREAK must be at least 1.")
         if self.latest_max_pages_per_source < 0:

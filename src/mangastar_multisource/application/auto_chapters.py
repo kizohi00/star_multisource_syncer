@@ -64,6 +64,69 @@ class AutoChapterPromotionService:
             "failures": failures,
         }
 
+    def promote_pending(
+        self,
+        adapters: Sequence[SourceAdapter],
+        *,
+        source_keys: Sequence[str] | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """Promote new chapters for already-mapped canonical series.
+
+        Latest-feed polling records source observations first. This pass turns
+        those observations into canonical chapters and verified pages, so the
+        application can serve them from ``chapters`` and the latest pointer.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+
+        exact_link_result = {"linked": 0, "series_refreshed": 0}
+        link_exact = getattr(self.repository, "link_pending_exact_chapters", None)
+        if callable(link_exact):
+            exact_link_result = link_exact(source_keys, limit=limit)
+
+        rows = self.repository.list_unpromoted_mapped_source_chapters(
+            source_keys,
+            limit=limit,
+        )
+        if self.max_workers == 1 or len(rows) <= 1:
+            outcomes = [self._promote_one(row, adapters) for row in rows]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(self.max_workers, len(rows)),
+                thread_name_prefix="chapter-promote",
+            ) as executor:
+                outcomes = list(executor.map(
+                    lambda row: self._promote_one(row, adapters),
+                    rows,
+                ))
+
+        promoted = 0
+        already_applied = 0
+        fallback_count = 0
+        failures: list[dict] = []
+        for outcome in outcomes:
+            fallback_count += int(bool(outcome.get("fallback_used")))
+            if outcome["status"] == "failure":
+                failures.append(outcome["failure"])
+                continue
+            result_status = str(outcome["chapter_status"])
+            if result_status in {"created", "applied"}:
+                promoted += 1
+            elif result_status in {"already_applied", "already_mapped"}:
+                already_applied += 1
+
+        return {
+            "source_keys": list(source_keys or []),
+            "exact_linked": int(exact_link_result.get("linked", 0)),
+            "attempted": len(outcomes),
+            "promoted": promoted,
+            "already_applied": already_applied,
+            "fallbacks": fallback_count,
+            "failed": len(failures),
+            "failures": failures,
+        }
+
     def _promote_one(
         self,
         row: dict,
