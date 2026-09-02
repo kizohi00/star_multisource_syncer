@@ -83,6 +83,8 @@ class Settings:
     enrichment_workers: int = 3
     page_workers: int = 3
     chapter_promotion_limit: int = 50
+    backfill_enabled: bool = True
+    backfill_interval_seconds: int = 86400
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -113,6 +115,8 @@ class Settings:
             enrichment_workers=_env_int("MANGA_ENRICHMENT_WORKERS", 3),
             page_workers=_env_int("MANGA_PAGE_WORKERS", 3),
             chapter_promotion_limit=_env_int("MANGA_CHAPTER_PROMOTION_LIMIT", 50),
+            backfill_enabled=_env_bool("MANGA_BACKFILL_ENABLED", True),
+            backfill_interval_seconds=_env_int("MANGA_BACKFILL_INTERVAL_SECONDS", 86400),
         )
 
     def validate(self, *, require_password: bool = True) -> None:
@@ -146,3 +150,5 @@ class Settings:
             raise ValueError("MANGA_LATEST_KNOWN_STREAK must be at least 1.")
         if self.latest_max_pages_per_source < 0:
             raise ValueError("MANGA_LATEST_MAX_PAGES_PER_SOURCE cannot be negative.")
+        if self.backfill_interval_seconds < 0:
+            raise ValueError("MANGA_BACKFILL_INTERVAL_SECONDS cannot be negative.")

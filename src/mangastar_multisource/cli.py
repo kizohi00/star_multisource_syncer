@@ -190,6 +190,8 @@ def main(argv: list[str] | None = None) -> None:
             max_pages_per_source=(
                 settings.latest_max_pages_per_source if args.max_pages is None else args.max_pages
             ),
+            backfill_enabled=settings.backfill_enabled,
+            backfill_interval_seconds=settings.backfill_interval_seconds,
         )
         enrichment_service = WorkEnrichmentService(
             repository,
@@ -275,6 +277,8 @@ def main(argv: list[str] | None = None) -> None:
         max_pages_per_source=(
             settings.latest_max_pages_per_source if args.max_pages is None else args.max_pages
         ),
+        backfill_enabled=settings.backfill_enabled,
+        backfill_interval_seconds=settings.backfill_interval_seconds,
     )
     results = service.poll(adapters, limit=args.limit or settings.max_latest_items)
     print(json.dumps([result.__dict__ for result in results], ensure_ascii=False))

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -22,6 +22,15 @@ class PollResult:
     error: str | None = None
     pages_scanned: int = 0
     stop_reason: str | None = None
+    backfill_page: int | None = None
+    backfill_status: str | None = None
+    backfill_works: int = 0
+    backfill_chapters: int = 0
+    backfill_new_works: int = 0
+    backfill_new_chapters: int = 0
+    backfill_next_page: int | None = None
+    backfill_stop_reason: str | None = None
+    backfill_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,15 +51,21 @@ class LatestFeedService:
         *,
         known_work_streak: int = 5,
         max_pages_per_source: int = 100,
+        backfill_enabled: bool = True,
+        backfill_interval_seconds: int = 86400,
     ) -> None:
         if known_work_streak < 1:
             raise ValueError("known_work_streak must be at least 1")
         if max_pages_per_source < 0:
             raise ValueError("max_pages_per_source cannot be negative")
+        if backfill_interval_seconds < 0:
+            raise ValueError("backfill_interval_seconds cannot be negative")
         self.repository = repository
         self.matcher = matcher
         self.known_work_streak = known_work_streak
         self.max_pages_per_source = max_pages_per_source
+        self.backfill_enabled = backfill_enabled
+        self.backfill_interval_seconds = backfill_interval_seconds
 
     def poll(self, adapters: tuple[SourceAdapter, ...], *, limit: int) -> list[PollResult]:
         # Load only titles/aliases before network discovery. Expensive fields
@@ -108,7 +123,163 @@ class LatestFeedService:
                     message = f"{type(exc).__name__}: {exc}"
                     self.repository.mark_poll_failure(adapter.key, message)
                     results.append(PollResult(adapter.key, "failed", error=message))
+            backfill_results = self._run_backfill(
+                adapters,
+                limit=limit,
+                canonical_series=canonical_series,
+            )
+            results = [
+                replace(result, **backfill_results[result.source_key])
+                if result.source_key in backfill_results
+                else result
+                for result in results
+            ]
         return sorted(results, key=lambda result: result.source_key)
+
+    def _run_backfill(
+        self,
+        adapters: tuple[SourceAdapter, ...],
+        *,
+        limit: int,
+        canonical_series: list,
+    ) -> dict[str, dict]:
+        """Process one historical feed page per source when its cursor is due.
+
+        The normal latest-feed scan is intentionally head-based. This separate
+        cursor gives old pages a bounded, persistent path to the same upsert
+        logic without changing latest-feed health telemetry.
+        """
+        if not self.backfill_enabled:
+            return {}
+        claim_page = getattr(self.repository, "claim_source_backfill_page", None)
+        complete_page = getattr(self.repository, "complete_source_backfill_page", None)
+        fail_page = getattr(self.repository, "fail_source_backfill_page", None)
+        if not callable(claim_page) or not callable(complete_page) or not callable(fail_page):
+            return {}
+
+        claimed: list[tuple[SourceAdapter, int]] = []
+        results: dict[str, dict] = {}
+        for adapter in adapters:
+            try:
+                page = claim_page(
+                    adapter.key,
+                    interval_seconds=self.backfill_interval_seconds,
+                )
+            except Exception as exc:
+                results[adapter.key] = self._backfill_failure_info(
+                    error=f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if page is None:
+                continue
+            page = int(page)
+            if self.max_pages_per_source and page > self.max_pages_per_source:
+                try:
+                    next_page = complete_page(
+                        adapter.key,
+                        page,
+                        has_more=False,
+                        stop_reason="max_pages",
+                    )
+                    results[adapter.key] = {
+                        "backfill_page": page,
+                        "backfill_status": "complete",
+                        "backfill_next_page": next_page,
+                        "backfill_stop_reason": "max_pages",
+                    }
+                except Exception as exc:
+                    self._release_backfill_page(fail_page, adapter.key, page, exc)
+                    results[adapter.key] = self._backfill_failure_info(
+                        page=page,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                continue
+            claimed.append((adapter, page))
+
+        if not claimed:
+            return results
+
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(claimed)),
+            thread_name_prefix="source-backfill",
+        ) as executor:
+            jobs = {
+                executor.submit(self._fetch_page, adapter, page, limit=limit): (adapter, page)
+                for adapter, page in claimed
+            }
+            for future in as_completed(jobs):
+                adapter, page = jobs[future]
+                try:
+                    feed, supports_pagination = future.result()
+                    stop_reason = self._backfill_stop_reason(
+                        feed,
+                        supports_pagination=supports_pagination,
+                        page=page,
+                    )
+                    persisted = self._persist(
+                        adapter,
+                        FeedDiscovery(feed, page, 0, stop_reason),
+                        canonical_series,
+                        record_poll=False,
+                    )
+                    has_more = stop_reason == "backfill_page"
+                    next_page = complete_page(
+                        adapter.key,
+                        page,
+                        has_more=has_more,
+                        stop_reason=stop_reason,
+                    )
+                    results[adapter.key] = {
+                        "backfill_page": page,
+                        "backfill_status": "success" if has_more else "complete",
+                        "backfill_works": persisted.works,
+                        "backfill_chapters": persisted.chapters,
+                        "backfill_new_works": persisted.new_works,
+                        "backfill_new_chapters": persisted.new_chapters,
+                        "backfill_next_page": next_page,
+                        "backfill_stop_reason": stop_reason,
+                    }
+                except Exception as exc:
+                    self._release_backfill_page(fail_page, adapter.key, page, exc)
+                    results[adapter.key] = self._backfill_failure_info(
+                        page=page,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+        return results
+
+    def _backfill_stop_reason(
+        self,
+        feed: LatestFeedSnapshot,
+        *,
+        supports_pagination: bool,
+        page: int,
+    ) -> str:
+        if not supports_pagination:
+            return "not_paginated"
+        if not feed.works:
+            return "empty_page"
+        if feed.has_more is False:
+            return "source_end"
+        if self.max_pages_per_source and page >= self.max_pages_per_source:
+            return "max_pages"
+        return "backfill_page"
+
+    @staticmethod
+    def _release_backfill_page(fail_page, source_key: str, page: int, original_error: Exception) -> None:
+        try:
+            fail_page(source_key, page, f"{type(original_error).__name__}: {original_error}")
+        except Exception:
+            # Preserve the original failure. An expired lease will make the
+            # page claimable again even if recording the failure also fails.
+            pass
+
+    @staticmethod
+    def _backfill_failure_info(*, page: int | None = None, error: str) -> dict:
+        return {
+            "backfill_page": page,
+            "backfill_status": "failed",
+            "backfill_error": error,
+        }
 
     def _load_frontier(self, source_key: str) -> dict[str, SourceWorkFrontier]:
         loader = getattr(self.repository, "load_source_frontier", None)
@@ -236,7 +407,14 @@ class LatestFeedService:
         published = chapter.published_at.timestamp() if chapter.published_at else float("-inf")
         return chapter.number is not None, number, published
 
-    def _persist(self, adapter: SourceAdapter, discovery: FeedDiscovery, canonical_series: list) -> PollResult:
+    def _persist(
+        self,
+        adapter: SourceAdapter,
+        discovery: FeedDiscovery,
+        canonical_series: list,
+        *,
+        record_poll: bool = True,
+    ) -> PollResult:
         feed = discovery.feed
         decisions = {}
         for work in feed.works:
@@ -249,6 +427,7 @@ class LatestFeedService:
             pages_scanned=discovery.pages_scanned,
             known_streak=discovery.known_streak,
             stop_reason=discovery.stop_reason,
+            record_poll=record_poll,
         )
         return PollResult(
             adapter.key,

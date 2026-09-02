@@ -117,8 +117,13 @@ class MySqlSourceRepository:
         pages_scanned: int | None = None,
         known_streak: int = 0,
         stop_reason: str | None = None,
+        record_poll: bool = True,
     ) -> tuple[int, int, int]:
-        """Persist one feed and return (new works, observed chapters, new chapters)."""
+        """Persist one feed and return (new works, observed chapters, new chapters).
+
+        Historical backfill pages share the same upsert path but do not replace
+        the normal latest-feed health counters or telemetry row.
+        """
         new_works = 0
         chapter_count = 0
         new_chapter_count = 0
@@ -151,36 +156,51 @@ class MySqlSourceRepository:
                     new_chapter_count += new_chapters
                     if existing is None:
                         new_works += 1
-                cursor.execute(
-                    """
-                    UPDATE ms_sources
-                    SET last_success_at=CURRENT_TIMESTAMP, last_error_at=NULL, last_error=NULL,
-                        last_feed_count=%s, last_new_count=%s, updated_at=CURRENT_TIMESTAMP
-                    WHERE source_key=%s
-                    """,
-                    (len(feed.works), new_works, feed.source_key),
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO ms_poll_runs
-                      (source_key, status, fetched_count, new_count, pages_scanned,
-                       known_streak, stop_reason, finished_at)
-                    VALUES (%s, 'success', %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    """,
-                    (
-                        feed.source_key,
-                        len(feed.works),
-                        new_works,
-                        feed.page if pages_scanned is None else pages_scanned,
-                        known_streak,
-                        stop_reason,
-                    ),
-                )
+                if record_poll:
+                    cursor.execute(
+                        """
+                        UPDATE ms_sources
+                        SET last_success_at=CURRENT_TIMESTAMP, last_error_at=NULL, last_error=NULL,
+                            last_feed_count=%s, last_new_count=%s, updated_at=CURRENT_TIMESTAMP
+                        WHERE source_key=%s
+                        """,
+                        (len(feed.works), new_works, feed.source_key),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO ms_poll_runs
+                          (source_key, status, fetched_count, new_count, pages_scanned,
+                           known_streak, stop_reason, finished_at)
+                        VALUES (%s, 'success', %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            feed.source_key,
+                            len(feed.works),
+                            new_works,
+                            feed.page if pages_scanned is None else pages_scanned,
+                            known_streak,
+                            stop_reason,
+                        ),
+                    )
         return new_works, chapter_count, new_chapter_count
 
-    @staticmethod
-    def _upsert_work_cursor(cursor, snapshot: SourceWorkSnapshot, match: MatchResult) -> int:
+    def _upsert_work_cursor(self, cursor, snapshot: SourceWorkSnapshot, match: MatchResult) -> int:
         source_hash = _hash_key(snapshot.source_work_key)
+        effective_match = match
+        if match.canonical_series_id is None:
+            exact_title_series = self._find_exact_title_series_cursor(cursor, snapshot.title)
+            if exact_title_series is not None:
+                effective_match = MatchResult(
+                    "matched",
+                    int(exact_title_series["id"]),
+                    1.0,
+                    1.0,
+                    {
+                        "reason": "exact_title_guard",
+                        "source_title": snapshot.title,
+                        "canonical_title": exact_title_series["title"],
+                    },
+                )
         cursor.execute(
             """
             INSERT INTO ms_source_works
@@ -212,9 +232,9 @@ class MySqlSourceRepository:
                 snapshot.cover_url,
                 json.dumps(snapshot.tags, ensure_ascii=False),
                 json.dumps(_snapshot_payload(snapshot), ensure_ascii=False),
-                match.status,
-                match.score,
-                match.canonical_series_id,
+                effective_match.status,
+                effective_match.score,
+                effective_match.canonical_series_id,
             ),
         )
         cursor.execute(
@@ -225,16 +245,40 @@ class MySqlSourceRepository:
         if not row:
             raise RuntimeError("Source work upsert did not return an id.")
         source_work_id = int(row["id"])
-        if match.status == "matched" and match.canonical_series_id is not None and row["canonical_series_id"] is None:
+        if (
+            effective_match.status == "matched"
+            and effective_match.canonical_series_id is not None
+            and row["canonical_series_id"] is None
+        ):
             cursor.execute(
                 """
                 UPDATE ms_source_works
                 SET canonical_series_id=%s, match_status='matched', match_score=%s, updated_at=CURRENT_TIMESTAMP
                 WHERE id=%s
                 """,
-                (match.canonical_series_id, match.score, source_work_id),
+                (effective_match.canonical_series_id, effective_match.score, source_work_id),
             )
         return source_work_id
+
+    @staticmethod
+    def _find_exact_title_series_cursor(cursor, title: object) -> dict | None:
+        value = str(title or "").strip()
+        if not value:
+            return None
+        cursor.execute(
+            """
+            SELECT id, title
+            FROM series
+            WHERE deleted_at IS NULL
+              AND title IS NOT NULL
+              AND LOWER(TRIM(title))=LOWER(TRIM(%s))
+            ORDER BY id
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (value,),
+        )
+        return cursor.fetchone()
 
     @staticmethod
     def _upsert_chapters_cursor(
@@ -319,6 +363,147 @@ class MySqlSourceRepository:
                       updated_at = CURRENT_TIMESTAMP
                     """,
                     (source_key, display_name, base_url),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO ms_source_backfill_state (source_key, next_page)
+                    VALUES (%s, 2)
+                    ON DUPLICATE KEY UPDATE source_key=VALUES(source_key)
+                    """,
+                    (source_key,),
+                )
+
+    def claim_source_backfill_page(
+        self,
+        source_key: str,
+        *,
+        interval_seconds: int = 86400,
+        lease_seconds: int = 1800,
+    ) -> int | None:
+        """Claim the next historical page, or return None when not due.
+
+        The short lease prevents overlapping Railway invocations from moving
+        the cursor past a page whose first attempt has not finished. A failed
+        fetch releases the lease without advancing the cursor.
+        """
+        if interval_seconds < 0:
+            raise ValueError("interval_seconds cannot be negative")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be at least 1")
+        with self.database.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO ms_source_backfill_state (source_key, next_page)
+                    VALUES (%s, 2)
+                    ON DUPLICATE KEY UPDATE source_key=VALUES(source_key)
+                    """,
+                    (source_key,),
+                )
+                cursor.execute(
+                    """
+                    SELECT next_page,
+                           in_flight_page,
+                           lease_until,
+                           cycle_completed_at,
+                           (
+                               cycle_completed_at IS NULL
+                               OR TIMESTAMPDIFF(SECOND, cycle_completed_at, CURRENT_TIMESTAMP) >= %s
+                           ) AS is_due,
+                           (
+                               in_flight_page IS NULL
+                               OR lease_until IS NULL
+                               OR lease_until <= CURRENT_TIMESTAMP
+                           ) AS lease_available
+                    FROM ms_source_backfill_state
+                    WHERE source_key=%s
+                    FOR UPDATE
+                    """,
+                    (interval_seconds, source_key),
+                )
+                row = cursor.fetchone()
+                if not row or not row["is_due"] or not row["lease_available"]:
+                    return None
+                page = max(2, int(row["next_page"]))
+                cursor.execute(
+                    """
+                    UPDATE ms_source_backfill_state
+                    SET in_flight_page=%s,
+                        lease_until=DATE_ADD(CURRENT_TIMESTAMP, INTERVAL %s SECOND),
+                        last_error=NULL,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE source_key=%s
+                    """,
+                    (page, lease_seconds, source_key),
+                )
+                return page
+
+    def complete_source_backfill_page(
+        self,
+        source_key: str,
+        page: int,
+        *,
+        has_more: bool,
+        stop_reason: str,
+    ) -> int | None:
+        """Advance the historical cursor after a successful page fetch."""
+        if page < 2:
+            raise ValueError("backfill page must be at least 2")
+        with self.database.transaction() as connection:
+            with connection.cursor() as cursor:
+                if has_more:
+                    cursor.execute(
+                        """
+                        UPDATE ms_source_backfill_state
+                        SET next_page=GREATEST(next_page, %s),
+                            in_flight_page=NULL,
+                            lease_until=NULL,
+                            last_scanned_page=%s,
+                            last_scanned_at=CURRENT_TIMESTAMP,
+                            last_error=NULL,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE source_key=%s AND in_flight_page=%s
+                        """,
+                        (page + 1, page, source_key, page),
+                    )
+                    next_page = page + 1
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE ms_source_backfill_state
+                        SET next_page=2,
+                            in_flight_page=NULL,
+                            lease_until=NULL,
+                            last_scanned_page=%s,
+                            last_scanned_at=CURRENT_TIMESTAMP,
+                            cycle_completed_at=CURRENT_TIMESTAMP,
+                            last_error=NULL,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE source_key=%s AND in_flight_page=%s
+                        """,
+                        (page, source_key, page),
+                    )
+                    next_page = 2
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"backfill cursor claim changed before completing page {page} ({stop_reason})"
+                    )
+                return next_page
+
+    def fail_source_backfill_page(self, source_key: str, page: int, error: str) -> None:
+        """Release a failed page claim so the same page is retried later."""
+        with self.database.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE ms_source_backfill_state
+                    SET in_flight_page=NULL,
+                        lease_until=NULL,
+                        last_error=%s,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE source_key=%s AND in_flight_page=%s
+                    """,
+                    (error[:2000], source_key, page),
                 )
 
     def load_source_frontier(self, source_key: str) -> dict[str, SourceWorkFrontier]:
@@ -1510,6 +1695,30 @@ class MySqlSourceRepository:
                         "reason": "details_not_enriched",
                         "source_work_id": int(source_work_id),
                     }
+                # A temporary/incomplete candidate scan must not create a
+                # second canonical series when the database already has the
+                # exact same title. This also protects legacy copies whose
+                # related tables contain references to unused series ids.
+                exact_title_series = self._find_exact_title_series_cursor(cursor, work["title_raw"])
+                if exact_title_series is not None:
+                    exact_series_id = int(exact_title_series["id"])
+                    cursor.execute(
+                        """
+                        UPDATE ms_source_works
+                        SET canonical_series_id=%s, match_status='matched',
+                            match_score=1.000000, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=%s AND canonical_series_id IS NULL
+                        """,
+                        (exact_series_id, source_work_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("source work mapping changed during exact-title guard")
+                    return {
+                        "status": "already_mapped",
+                        "reason": "exact_title_guard",
+                        "source_work_id": int(source_work_id),
+                        "canonical_series_id": exact_series_id,
+                    }
                 score = float(work["match_score"] or 0.0)
                 if work["match_status"] != "unmatched":
                     return {
@@ -1742,8 +1951,8 @@ class MySqlSourceRepository:
                 INSERT INTO chapters
                   (chapter_ref_id, series_id, team_id, views, chapter_number, season,
                    title, storage_key, source_url, source_key, source_release_date,
-                   chapter_views, created_at)
-                VALUES (%s, %s, NULL, 0, %s, NULL, %s, NULL, %s, %s, %s, 0, %s)
+                   chapter_views)
+                VALUES (%s, %s, NULL, 0, %s, NULL, %s, NULL, %s, %s, %s, 0)
                 """,
                 (
                     source_chapter_id,
@@ -1753,7 +1962,6 @@ class MySqlSourceRepository:
                     _bounded_text(chapter["source_url"], 500),
                     source_key,
                     _format_release_date(chapter["published_at"]),
-                    chapter["published_at"],
                 ),
             )
             canonical_chapter_id = int(cursor.lastrowid)
@@ -1848,7 +2056,9 @@ class MySqlSourceRepository:
             SELECT id
             FROM chapters
             WHERE series_id=%s AND deleted_at IS NULL
-            ORDER BY chapter_number DESC, created_at DESC, id DESC
+            ORDER BY chapter_number DESC,
+                     COALESCE(created_at, '1000-01-01 00:00:00') DESC,
+                     id DESC
             LIMIT 1
             """,
             (series_id,),
@@ -1883,10 +2093,32 @@ class MySqlSourceRepository:
         )
 
     def _allocate_series_id_cursor(self, cursor) -> int:
+        # Some legacy copies were created without foreign keys and can contain
+        # chapter/tag/latest rows that reference a series id before its series
+        # row exists. Looking only at MAX(series.id) could therefore reuse one
+        # of those ids and silently adopt unrelated legacy data.
         cursor.execute(
-            "SELECT COALESCE(MAX(id), 0) + 1 AS minimum_next_id FROM series"
+            """
+            SELECT TABLE_NAME, COLUMN_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND COLUMN_NAME IN ('series_id', 'canonical_series_id', 'applied_series_id')
+            ORDER BY TABLE_NAME, COLUMN_NAME
+            """
         )
-        minimum_next_id = int(cursor.fetchone()["minimum_next_id"])
+        reference_columns = list(cursor.fetchall())
+        minimum_next_id = 1
+        for reference in reference_columns:
+            table_name = str(reference["TABLE_NAME"]).replace("`", "``")
+            column_name = str(reference["COLUMN_NAME"]).replace("`", "``")
+            cursor.execute(
+                f"SELECT COALESCE(MAX(`{column_name}`), 0) + 1 AS minimum_next_id "
+                f"FROM `{table_name}`"
+            )
+            minimum_next_id = max(
+                minimum_next_id,
+                int(cursor.fetchone()["minimum_next_id"]),
+            )
         cursor.execute(
             "SELECT next_id FROM ms_canonical_id_sequences WHERE entity='series' FOR UPDATE"
         )
