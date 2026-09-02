@@ -178,9 +178,23 @@ class MySqlSourceRepository:
                 )
         return new_works, chapter_count, new_chapter_count
 
-    @staticmethod
-    def _upsert_work_cursor(cursor, snapshot: SourceWorkSnapshot, match: MatchResult) -> int:
+    def _upsert_work_cursor(self, cursor, snapshot: SourceWorkSnapshot, match: MatchResult) -> int:
         source_hash = _hash_key(snapshot.source_work_key)
+        effective_match = match
+        if match.canonical_series_id is None:
+            exact_title_series = self._find_exact_title_series_cursor(cursor, snapshot.title)
+            if exact_title_series is not None:
+                effective_match = MatchResult(
+                    "matched",
+                    int(exact_title_series["id"]),
+                    1.0,
+                    1.0,
+                    {
+                        "reason": "exact_title_guard",
+                        "source_title": snapshot.title,
+                        "canonical_title": exact_title_series["title"],
+                    },
+                )
         cursor.execute(
             """
             INSERT INTO ms_source_works
@@ -212,9 +226,9 @@ class MySqlSourceRepository:
                 snapshot.cover_url,
                 json.dumps(snapshot.tags, ensure_ascii=False),
                 json.dumps(_snapshot_payload(snapshot), ensure_ascii=False),
-                match.status,
-                match.score,
-                match.canonical_series_id,
+                effective_match.status,
+                effective_match.score,
+                effective_match.canonical_series_id,
             ),
         )
         cursor.execute(
@@ -225,16 +239,40 @@ class MySqlSourceRepository:
         if not row:
             raise RuntimeError("Source work upsert did not return an id.")
         source_work_id = int(row["id"])
-        if match.status == "matched" and match.canonical_series_id is not None and row["canonical_series_id"] is None:
+        if (
+            effective_match.status == "matched"
+            and effective_match.canonical_series_id is not None
+            and row["canonical_series_id"] is None
+        ):
             cursor.execute(
                 """
                 UPDATE ms_source_works
                 SET canonical_series_id=%s, match_status='matched', match_score=%s, updated_at=CURRENT_TIMESTAMP
                 WHERE id=%s
                 """,
-                (match.canonical_series_id, match.score, source_work_id),
+                (effective_match.canonical_series_id, effective_match.score, source_work_id),
             )
         return source_work_id
+
+    @staticmethod
+    def _find_exact_title_series_cursor(cursor, title: object) -> dict | None:
+        value = str(title or "").strip()
+        if not value:
+            return None
+        cursor.execute(
+            """
+            SELECT id, title
+            FROM series
+            WHERE deleted_at IS NULL
+              AND title IS NOT NULL
+              AND LOWER(TRIM(title))=LOWER(TRIM(%s))
+            ORDER BY id
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (value,),
+        )
+        return cursor.fetchone()
 
     @staticmethod
     def _upsert_chapters_cursor(
@@ -1510,6 +1548,30 @@ class MySqlSourceRepository:
                         "reason": "details_not_enriched",
                         "source_work_id": int(source_work_id),
                     }
+                # A temporary/incomplete candidate scan must not create a
+                # second canonical series when the database already has the
+                # exact same title. This also protects legacy copies whose
+                # related tables contain references to unused series ids.
+                exact_title_series = self._find_exact_title_series_cursor(cursor, work["title_raw"])
+                if exact_title_series is not None:
+                    exact_series_id = int(exact_title_series["id"])
+                    cursor.execute(
+                        """
+                        UPDATE ms_source_works
+                        SET canonical_series_id=%s, match_status='matched',
+                            match_score=1.000000, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=%s AND canonical_series_id IS NULL
+                        """,
+                        (exact_series_id, source_work_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("source work mapping changed during exact-title guard")
+                    return {
+                        "status": "already_mapped",
+                        "reason": "exact_title_guard",
+                        "source_work_id": int(source_work_id),
+                        "canonical_series_id": exact_series_id,
+                    }
                 score = float(work["match_score"] or 0.0)
                 if work["match_status"] != "unmatched":
                     return {
@@ -1847,7 +1909,9 @@ class MySqlSourceRepository:
             SELECT id
             FROM chapters
             WHERE series_id=%s AND deleted_at IS NULL
-            ORDER BY chapter_number DESC, created_at DESC, id DESC
+            ORDER BY chapter_number DESC,
+                     COALESCE(created_at, '1000-01-01 00:00:00') DESC,
+                     id DESC
             LIMIT 1
             """,
             (series_id,),
@@ -1882,10 +1946,32 @@ class MySqlSourceRepository:
         )
 
     def _allocate_series_id_cursor(self, cursor) -> int:
+        # Some legacy copies were created without foreign keys and can contain
+        # chapter/tag/latest rows that reference a series id before its series
+        # row exists. Looking only at MAX(series.id) could therefore reuse one
+        # of those ids and silently adopt unrelated legacy data.
         cursor.execute(
-            "SELECT COALESCE(MAX(id), 0) + 1 AS minimum_next_id FROM series"
+            """
+            SELECT TABLE_NAME, COLUMN_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND COLUMN_NAME IN ('series_id', 'canonical_series_id', 'applied_series_id')
+            ORDER BY TABLE_NAME, COLUMN_NAME
+            """
         )
-        minimum_next_id = int(cursor.fetchone()["minimum_next_id"])
+        reference_columns = list(cursor.fetchall())
+        minimum_next_id = 1
+        for reference in reference_columns:
+            table_name = str(reference["TABLE_NAME"]).replace("`", "``")
+            column_name = str(reference["COLUMN_NAME"]).replace("`", "``")
+            cursor.execute(
+                f"SELECT COALESCE(MAX(`{column_name}`), 0) + 1 AS minimum_next_id "
+                f"FROM `{table_name}`"
+            )
+            minimum_next_id = max(
+                minimum_next_id,
+                int(cursor.fetchone()["minimum_next_id"]),
+            )
         cursor.execute(
             "SELECT next_id FROM ms_canonical_id_sequences WHERE entity='series' FOR UPDATE"
         )
