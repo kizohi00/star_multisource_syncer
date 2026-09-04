@@ -9,7 +9,17 @@ from bs4 import BeautifulSoup, Tag
 
 from ..domain.errors import SourceChapterLocked
 from ..domain.models import LatestFeedSnapshot, SourceChapterSnapshot, SourcePageSnapshot, SourceWorkSnapshot
-from .base import HtmlLatestAdapter, absolute_url, clean_text, has_next_page, parse_chapter_number, parse_datetime, path_key, response_html
+from .base import (
+    HtmlLatestAdapter,
+    absolute_url,
+    clean_html_text,
+    clean_text,
+    has_next_page,
+    parse_chapter_number,
+    parse_datetime,
+    path_key,
+    response_html,
+)
 
 
 class TeamXNovelAdapter(HtmlLatestAdapter):
@@ -97,7 +107,7 @@ class TeamXNovelAdapter(HtmlLatestAdapter):
         soup = BeautifulSoup(html, "html.parser")
         work_key = self._work_key(source_url)
         title = clean_text(soup.select_one("h1")) or work_key.rsplit("/", 1)[-1].replace("-", " ")
-        summary = clean_text(soup.select_one(".review-content")) or None
+        summary = clean_html_text(soup.select_one(".review-content")) or None
         cover_node = soup.select_one("meta[property='og:image']")
         cover_url = cover_node.get("content") if cover_node else None
         tags = tuple(clean_text(node) for node in soup.select(".review-author-info a") if clean_text(node))

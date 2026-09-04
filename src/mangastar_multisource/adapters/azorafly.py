@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
+from html import unescape
 
 import requests
 from bs4 import BeautifulSoup, Tag
 
 from ..domain.errors import SourceChapterLocked
 from ..domain.models import LatestFeedSnapshot, SourceChapterSnapshot, SourcePageSnapshot, SourceWorkSnapshot
-from .base import HtmlLatestAdapter, absolute_url, clean_text, parse_chapter_number, parse_datetime, path_key
+from .base import (
+    HtmlLatestAdapter,
+    absolute_url,
+    clean_html_text,
+    clean_text,
+    parse_chapter_number,
+    parse_datetime,
+    path_key,
+    response_html,
+)
 
 
 class AzoraFlyAdapter(HtmlLatestAdapter):
@@ -104,12 +115,14 @@ class AzoraFlyAdapter(HtmlLatestAdapter):
         )
 
     def fetch_work_details(self, source_url: str) -> SourceWorkSnapshot:
-        soup = self._get_soup(source_url)
+        response = self._get_response(source_url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response_html(response), "html.parser")
         work_key = self._work_key(source_url)
         headings = [node for node in soup.select("h1") if clean_text(node)]
         title = clean_text(headings[-1]) if headings else work_key.rsplit("/", 1)[-1].replace("-", " ")
         summary_node = soup.select_one("meta[name='description']")
-        summary = summary_node.get("content") if summary_node else None
+        summary = clean_html_text(summary_node.get("content")) if summary_node else None
         # Azora's og:image is a generated SEO preview endpoint and is not a
         # stable copy of the actual series cover. The original storage URL is
         # exposed in JSON-LD and in the rendered cover image, so prefer those
@@ -118,6 +131,70 @@ class AzoraFlyAdapter(HtmlLatestAdapter):
         if not cover_url:
             cover_node = soup.select_one("meta[property='og:image']")
             cover_url = cover_node.get("content") if cover_node else None
+        chapters = self._fetch_full_chapter_list(soup, work_key)
+        return SourceWorkSnapshot(
+            source_key=self.key,
+            source_work_key=work_key,
+            source_url=source_url,
+            title=title,
+            summary=summary,
+            cover_url=cover_url,
+            chapters=tuple(chapters),
+            payload={
+                "detail_url": source_url,
+                "chapter_index": "api/chapters?postId=...&skip=0&take=all&order=desc",
+            },
+        )
+
+    def _fetch_full_chapter_list(
+        self,
+        soup: BeautifulSoup,
+        work_key: str,
+    ) -> tuple[SourceChapterSnapshot, ...]:
+        """Use Azora's chapter API instead of the page's 20-item preview.
+
+        Azora renders chapter 1 plus only the newest 20 chapters in the
+        server HTML. The public API used by the site's own chapter browser
+        supports ``take=all`` and is required when a new series must be
+        imported completely.
+        """
+        post_id = self._post_id_from_html(str(soup))
+        if post_id:
+            try:
+                response = self._get_response(
+                    "https://api.azorafly.com/api/chapters",
+                    params={
+                        "postId": post_id,
+                        "skip": 0,
+                        "take": "all",
+                        "order": "desc",
+                    },
+                    headers={"Accept": "application/json"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                api_chapters = (
+                    payload.get("post", {}).get("chapters")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if isinstance(api_chapters, list) and api_chapters:
+                    chapters = tuple(
+                        self._api_chapter(work_key.rsplit("/", 1)[-1], chapter)
+                        for chapter in api_chapters
+                        if isinstance(chapter, dict)
+                    )
+                    if chapters:
+                        return chapters
+                raise RuntimeError("AzoraFly full chapter API returned no chapters")
+            except (requests.RequestException, ValueError, TypeError, AttributeError) as error:
+                # The HTML contains only a 20-item preview. Do not silently
+                # persist that preview as a complete series; retry enrichment
+                # later so a new series cannot be created without its history.
+                raise RuntimeError(
+                    "AzoraFly full chapter API was unavailable; refusing a partial chapter list"
+                ) from error
+
         chapters: list[SourceChapterSnapshot] = []
         seen: set[str] = set()
         for chapter_link in soup.select('a[href*="/chapter-"]'):
@@ -137,16 +214,21 @@ class AzoraFlyAdapter(HtmlLatestAdapter):
                     parse_datetime(time_node.get("datetime")) if time_node else None,
                 )
             )
-        return SourceWorkSnapshot(
-            source_key=self.key,
-            source_work_key=work_key,
-            source_url=source_url,
-            title=title,
-            summary=summary,
-            cover_url=cover_url,
-            chapters=tuple(chapters),
-            payload={"detail_url": source_url},
+        return tuple(chapters)
+
+    @staticmethod
+    def _post_id_from_html(html: str) -> str | None:
+        decoded = unescape(html)
+        patterns = (
+            r'"postId"\s*:\s*\[\s*0\s*,\s*(\d+)\s*\]',
+            r'"postId"\s*:\s*(\d+)',
+            r"data-post-id\s*=\s*[\"'](\d+)[\"']",
         )
+        for pattern in patterns:
+            match = re.search(pattern, decoded)
+            if match:
+                return match.group(1)
+        return None
 
     @classmethod
     def _extract_original_cover(cls, soup: BeautifulSoup) -> str | None:

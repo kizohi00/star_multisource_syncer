@@ -8,6 +8,7 @@ from ..domain.models import LatestFeedSnapshot, SourceChapterSnapshot, SourcePag
 from .base import (
     HtmlLatestAdapter,
     absolute_url,
+    clean_html_text,
     clean_text,
     extract_labeled_values,
     extract_structured_metadata,
@@ -99,7 +100,9 @@ class MangaTekAdapter(HtmlLatestAdapter):
         work_key = self._work_key(source_url)
         title_node = soup.select_one("h1, .manga-title")
         title = clean_text(title_node) or work_key.rsplit("/", 1)[-1].replace("-", " ")
-        summary = clean_text(soup.select_one(".manga-description, .description, .summary")) or None
+        summary = clean_html_text(
+            soup.select_one(".manga-description, .description, .summary")
+        ) or None
         cover_node = soup.select_one("meta[property='og:image']")
         cover_url = cover_node.get("content") if cover_node else None
         if not cover_url:

@@ -106,13 +106,25 @@ def main(argv: list[str] | None = None) -> None:
     settings = Settings.from_env()
     settings.validate()
     if args.command == "worker":
-        _log("configuration validated")
+        _log(
+            "configuration validated; content_database="
+            f"{settings.db_name}; sync_database={settings.effective_sync_db_name}"
+        )
     database = MySqlDatabase(settings)
     repository = MySqlSourceRepository(database)
 
     if args.command == "migrate":
         applied = database.apply_migrations(MIGRATIONS)
-        print(json.dumps({"database": settings.db_name, "applied": applied}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "content_database": settings.db_name,
+                    "sync_database": settings.effective_sync_db_name,
+                    "applied": applied,
+                },
+                ensure_ascii=False,
+            )
+        )
         return
 
     if args.command == "inspect":
@@ -120,14 +132,26 @@ def main(argv: list[str] | None = None) -> None:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT DATABASE() AS database_name, VERSION() AS version")
                 connection_info = cursor.fetchone()
-        print(json.dumps({"connection": connection_info, "pipeline": repository.counts()}, ensure_ascii=False, default=str))
+        print(
+            json.dumps(
+                {
+                    "connection": connection_info,
+                    "content_database": settings.db_name,
+                    "sync_database": settings.effective_sync_db_name,
+                    "pipeline": repository.counts(),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+        )
         return
 
     if args.command == "monitor":
         print(
             json.dumps(
                 {
-                    "database": settings.db_name,
+                    "content_database": settings.db_name,
+                    "sync_database": settings.effective_sync_db_name,
                     "sources": repository.source_health(set(args.sources or [])),
                 },
                 ensure_ascii=False,
@@ -146,7 +170,8 @@ def main(argv: list[str] | None = None) -> None:
             )
         else:
             result = {
-                "database": settings.db_name,
+                "content_database": settings.db_name,
+                "sync_database": settings.effective_sync_db_name,
                 "status": args.status,
                 "proposals": repository.list_promotion_queue(
                     status=args.status,

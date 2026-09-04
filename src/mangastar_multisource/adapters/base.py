@@ -22,6 +22,53 @@ def clean_text(node: Tag | None) -> str:
     return " ".join(node.get_text(" ", strip=True).split())
 
 
+def clean_html_text(value: object) -> str:
+    """Return readable text from a tag or an HTML/HTML-escaped string.
+
+    Some sources expose the description as an HTML fragment inside a meta
+    attribute. Storing that value directly makes the app display literal
+    ``<p>``/``<br>`` markup, so descriptions must pass through this normalizer
+    before they are persisted.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, Tag):
+        raw = value.decode_contents()
+    else:
+        raw = str(value)
+    parsed = BeautifulSoup(raw, "html.parser")
+    for line_break in parsed.find_all("br"):
+        line_break.replace_with(" ")
+    return " ".join(parsed.get_text(" ", strip=True).split())
+
+
+def extract_summary(soup: BeautifulSoup) -> str:
+    """Extract only the story synopsis from common WordPress/Madara layouts."""
+    # ``.summary_content`` (underscore) is the large metadata container on
+    # 3Asq. The actual synopsis is the more specific ``manga-excerpt`` or
+    # ``summary__content`` (double underscore) element.
+    selectors = (
+        ".manga-excerpt.summary__content",
+        ".description-summary .summary__content",
+        ".summary__content.show-more",
+        ".summary__content",
+        "[itemprop='description']",
+        ".description-summary",
+    )
+    for selector in selectors:
+        for node in soup.select(selector):
+            if "manga-excerpt" not in (node.get("class") or []) and any(
+                "summary_content" in (ancestor.get("class") or [])
+                for ancestor in node.parents
+                if isinstance(ancestor, Tag)
+            ):
+                continue
+            value = clean_html_text(node)
+            if value:
+                return value
+    return ""
+
+
 def extract_labeled_values(soup: BeautifulSoup, labels: tuple[str, ...]) -> tuple[str, ...]:
     """Extract values from common Madara/WordPress labelled metadata rows."""
     wanted = tuple(label.casefold() for label in labels)
@@ -99,7 +146,7 @@ def extract_structured_metadata(soup: BeautifulSoup) -> dict[str, object]:
                 )
             description = item.get("description")
             if isinstance(description, str) and description.strip():
-                result.setdefault("summary", description.strip())
+                result.setdefault("summary", clean_html_text(description))
 
     for key, value in list(result.items()):
         if isinstance(value, list):

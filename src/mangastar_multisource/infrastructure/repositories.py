@@ -4,6 +4,8 @@ import hashlib
 import json
 from collections.abc import Sequence
 
+from bs4 import BeautifulSoup
+
 from ..domain.models import (
     CanonicalSeries,
     LatestFeedSnapshot,
@@ -1027,11 +1029,45 @@ class MySqlSourceRepository:
                 chapter_count, _ = self._upsert_chapters_cursor(
                     cursor, source_work_id, snapshot, track_new=False
                 )
+                if match.canonical_series_id is not None and snapshot.summary:
+                    self._repair_canonical_summary_cursor(
+                        cursor,
+                        int(match.canonical_series_id),
+                        snapshot.summary,
+                    )
                 cursor.execute(
                     "UPDATE ms_source_works SET detail_fetched_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
                     (source_work_id,),
                 )
                 return source_work_id, chapter_count
+
+    @staticmethod
+    def _repair_canonical_summary_cursor(
+        cursor,
+        series_id: int,
+        summary: str,
+    ) -> None:
+        """Repair only clearly polluted/empty summaries from a fresh source snapshot."""
+        cursor.execute(
+            """
+            UPDATE series
+            SET summary=%s
+            WHERE id=%s
+              AND (
+                summary IS NULL
+                OR TRIM(summary)=''
+                OR summary LIKE '%%<p>%%'
+                OR summary LIKE '%%<blockquote>%%'
+                OR summary LIKE '%%&lt;p&gt;%%'
+                OR (
+                    summary LIKE '%%التقييم%%'
+                    AND summary LIKE '%%التصنيفات%%'
+                    AND summary LIKE '%%الفصول%%'
+                )
+              )
+            """,
+            (summary, series_id),
+        )
 
     def link_exact_chapters(self, source_work_id: int) -> dict[str, int]:
         """Link only a unique exact chapter number; leave duplicate releases for review."""
@@ -1787,7 +1823,7 @@ class MySqlSourceRepository:
             (
                 series_id,
                 _bounded_text(work["title_raw"], 255),
-                work["summary_raw"],
+                 _clean_summary_for_storage(work["summary_raw"]),
                 _bounded_text(work["cover_url"], 255),
                 source_payload,
             ),
@@ -2395,6 +2431,17 @@ def _bounded_text(value: object, limit: int) -> str | None:
         return None
     text = str(value).strip()
     return text[:limit] if text else None
+
+
+def _clean_summary_for_storage(value: object) -> str | None:
+    """Prevent legacy/source HTML fragments from reaching the app database."""
+    if value in (None, ""):
+        return None
+    parsed = BeautifulSoup(str(value), "html.parser")
+    for line_break in parsed.find_all("br"):
+        line_break.replace_with(" ")
+    text = " ".join(parsed.get_text(" ", strip=True).split())
+    return text or None
 
 
 def _json_or_value(raw: object) -> object:

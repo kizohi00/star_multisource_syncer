@@ -12,6 +12,7 @@ from .base import (
     absolute_url,
     clean_text,
     extract_labeled_values,
+    extract_summary,
     extract_structured_metadata,
     extract_tags,
     parse_datetime,
@@ -34,7 +35,10 @@ class WordPressAjaxMixin:
     so the adapter uses direct requests and does not require a proxy.
     """
 
-    _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+    # Cloudflare commonly uses 520 for a transient origin failure. Treat it
+    # like the other retryable gateway responses so one temporary SparkManga
+    # edge failure does not consume a mapping attempt.
+    _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504, 520})
     _MANGA_ID_PATTERNS = (
         re.compile(r'"manga_id"\s*:\s*"?(\d+)"?', re.IGNORECASE),
         re.compile(r"data-manga=[\"'](\d+)[\"']", re.IGNORECASE),
@@ -178,12 +182,7 @@ class WordPressAjaxMixin:
         work_key = self._work_key(source_url)
         title_node = soup.select_one("h1.entry-title, .post-title h1, h1")
         title = clean_text(title_node) or work_key.rsplit("/", 1)[-1].replace("-", " ")
-        summary = clean_text(
-            soup.select_one(
-                ".description-summary .summary__content, .summary__content, "
-                ".summary_content, .description-summary"
-            )
-        ) or None
+        summary = extract_summary(soup) or None
         cover_node = soup.select_one("meta[property='og:image']")
         cover_url = cover_node.get("content") if cover_node else None
         if not cover_url:

@@ -185,6 +185,10 @@ class WorkEnrichmentService:
                 auto_created_series_id is not None
                 or row.get("match_status") == "auto_created"
             ):
+                _log(
+                    f"enrichment: importing all {chapter_count} observed chapters "
+                    f"for new series {auto_created_series_id or row.get('canonical_series_id')}"
+                )
                 chapter_promotion = self.auto_chapters.promote_all(
                     source_work_id,
                     fallback_adapters or selected_adapters,

@@ -10,6 +10,7 @@ from .base import (
     absolute_url,
     clean_text,
     extract_labeled_values,
+    extract_summary,
     extract_structured_metadata,
     extract_tags,
     has_next_page,
@@ -96,7 +97,7 @@ class MadaraLatestAdapter(HtmlLatestAdapter):
         work_key = self._work_key(source_url)
         title_node = soup.select_one("h1.entry-title, .post-title h1, h1")
         title = clean_text(title_node) or work_key.rsplit("/", 1)[-1].replace("-", " ")
-        summary = clean_text(soup.select_one(".description-summary .summary__content, .summary__content, .summary_content, .description-summary")) or None
+        summary = extract_summary(soup) or None
         cover_node = soup.select_one("meta[property='og:image']")
         cover_url = cover_node.get("content") if cover_node else None
         if not cover_url:
