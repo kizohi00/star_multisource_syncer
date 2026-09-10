@@ -432,118 +432,6 @@ class MySqlSourceRepository:
                 )
                 return list(cursor.fetchall())
 
-    def link_pending_exact_chapters(
-        self,
-        source_keys: Sequence[str] | None = None,
-        *,
-        limit: int = 500,
-    ) -> dict[str, int]:
-        """Link pending source rows to the one canonical chapter with the same number.
-
-        A source can report a chapter that is already present in Manga Star under
-        another source. Those rows do not need another page download or a second
-        canonical chapter; they only need their source alias linked.
-        """
-        if limit < 1:
-            raise ValueError("limit must be at least 1")
-        source_filter, source_params = self._source_filter(source_keys, "sw.source_key")
-        linked = 0
-        touched_series: set[int] = set()
-        with self.database.transaction() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT sc.id AS source_chapter_id,
-                           sw.canonical_series_id,
-                           canonical.id AS canonical_chapter_id
-                    FROM ms_source_chapters AS sc
-                    INNER JOIN ms_source_works AS sw ON sw.id=sc.source_work_id
-                    INNER JOIN chapters AS canonical
-                      ON canonical.series_id=sw.canonical_series_id
-                     AND canonical.chapter_number=sc.chapter_number
-                     AND canonical.deleted_at IS NULL
-                    WHERE sw.canonical_series_id IS NOT NULL
-                      AND sc.canonical_chapter_id IS NULL
-                      AND sc.chapter_number IS NOT NULL
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM chapters AS duplicate
-                          WHERE duplicate.series_id=sw.canonical_series_id
-                            AND duplicate.chapter_number=sc.chapter_number
-                            AND duplicate.deleted_at IS NULL
-                            AND duplicate.id <> canonical.id
-                      )
-                      {source_filter}
-                    ORDER BY sc.last_seen_at DESC, sc.id DESC
-                    LIMIT %s
-                    FOR UPDATE
-                    """,
-                    [*source_params, limit],
-                )
-                rows = list(cursor.fetchall())
-                for row in rows:
-                    cursor.execute(
-                        """
-                        UPDATE ms_source_chapters
-                        SET canonical_chapter_id=%s, match_status='matched',
-                            match_score=1.000000, updated_at=CURRENT_TIMESTAMP
-                        WHERE id=%s AND canonical_chapter_id IS NULL
-                        """,
-                        (row["canonical_chapter_id"], row["source_chapter_id"]),
-                    )
-                    if cursor.rowcount == 1:
-                        linked += 1
-                        touched_series.add(int(row["canonical_series_id"]))
-                for series_id in touched_series:
-                    self._refresh_series_latest_chapter_cursor(cursor, series_id)
-        return {"linked": linked, "series_refreshed": len(touched_series)}
-
-    def list_unpromoted_mapped_source_chapters(
-        self,
-        source_keys: Sequence[str] | None = None,
-        *,
-        limit: int = 50,
-    ) -> list[dict]:
-        """Return retryable source chapters that still need canonical pages.
-
-        Rows whose chapter number already exists canonically are deliberately
-        excluded. ``link_pending_exact_chapters`` handles those aliases first;
-        this query is only for genuinely new canonical chapters.
-        """
-        if limit < 1:
-            raise ValueError("limit must be at least 1")
-        source_filter, source_params = self._source_filter(source_keys, "sw.source_key")
-        with self.database.transaction() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT sc.id, sc.source_work_id, sw.source_key,
-                           sw.canonical_series_id, sc.source_chapter_key,
-                           sc.source_url, sc.label_raw, sc.chapter_number,
-                           sc.title_raw, sc.canonical_chapter_id,
-                           sc.match_status, sc.access_status,
-                           sc.pages_fetched_at
-                    FROM ms_source_chapters AS sc
-                    INNER JOIN ms_source_works AS sw ON sw.id=sc.source_work_id
-                    WHERE sw.canonical_series_id IS NOT NULL
-                      AND sc.canonical_chapter_id IS NULL
-                      AND sc.chapter_number IS NOT NULL
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM chapters AS canonical
-                          WHERE canonical.series_id=sw.canonical_series_id
-                            AND canonical.chapter_number=sc.chapter_number
-                            AND canonical.deleted_at IS NULL
-                      )
-                      AND {self._retryable_source_chapter_condition("sw", "sc")}
-                      {source_filter}
-                    ORDER BY sc.last_seen_at DESC, sc.id DESC
-                    LIMIT %s
-                    """,
-                    [*source_params, limit],
-                )
-                return list(cursor.fetchall())
-
     def link_source_chapter_to_canonical(
         self,
         source_chapter_id: int,
@@ -619,49 +507,6 @@ class MySqlSourceRepository:
                     }
                 if chapter["canonical_series_id"] is None:
                     raise PromotionBlocked("source work is not mapped to a canonical series")
-
-                # A source may report a chapter that already exists in the
-                # canonical series under another source. Link that alias
-                # instead of creating a duplicate canonical chapter.
-                if chapter["chapter_number"] is not None:
-                    cursor.execute(
-                        """
-                        SELECT id
-                        FROM chapters
-                        WHERE series_id=%s AND chapter_number=%s AND deleted_at IS NULL
-                        ORDER BY created_at DESC, id DESC
-                        LIMIT 2
-                        FOR UPDATE
-                        """,
-                        (chapter["canonical_series_id"], chapter["chapter_number"]),
-                    )
-                    same_number = list(cursor.fetchall())
-                    if len(same_number) > 1:
-                        raise PromotionBlocked(
-                            "multiple canonical chapters already use this chapter number"
-                        )
-                    if same_number:
-                        canonical_chapter_id = int(same_number[0]["id"])
-                        cursor.execute(
-                            """
-                            UPDATE ms_source_chapters
-                            SET canonical_chapter_id=%s, match_status='matched',
-                                match_score=1.000000, updated_at=CURRENT_TIMESTAMP
-                            WHERE id=%s AND canonical_chapter_id IS NULL
-                            """,
-                            (canonical_chapter_id, source_chapter_id),
-                        )
-                        if cursor.rowcount != 1:
-                            raise RuntimeError("source chapter mapping changed while linking exact chapter")
-                        self._refresh_series_latest_chapter_cursor(
-                            cursor,
-                            int(chapter["canonical_series_id"]),
-                        )
-                        return {
-                            "status": "already_mapped",
-                            "source_chapter_id": int(source_chapter_id),
-                            "canonical_chapter_id": canonical_chapter_id,
-                        }
                 if chapter["access_status"] != "available" or chapter["pages_fetched_at"] is None:
                     raise PromotionBlocked("source chapter has no verified available pages")
 
@@ -954,11 +799,6 @@ class MySqlSourceRepository:
                             """,
                             (top_score, source_chapter["id"]),
                         )
-                if linked:
-                    self._refresh_series_latest_chapter_cursor(
-                        cursor,
-                        int(work["canonical_series_id"]),
-                    )
         return {"linked": linked, "ambiguous": ambiguous}
 
     def upsert_pages(self, source_chapter_id: int, pages: Sequence[SourcePageSnapshot]) -> int:
@@ -1742,8 +1582,8 @@ class MySqlSourceRepository:
                 INSERT INTO chapters
                   (chapter_ref_id, series_id, team_id, views, chapter_number, season,
                    title, storage_key, source_url, source_key, source_release_date,
-                   chapter_views, created_at)
-                VALUES (%s, %s, NULL, 0, %s, NULL, %s, NULL, %s, %s, %s, 0, %s)
+                   chapter_views)
+                VALUES (%s, %s, NULL, 0, %s, NULL, %s, NULL, %s, %s, %s, 0)
                 """,
                 (
                     source_chapter_id,
@@ -1753,7 +1593,6 @@ class MySqlSourceRepository:
                     _bounded_text(chapter["source_url"], 500),
                     source_key,
                     _format_release_date(chapter["published_at"]),
-                    chapter["published_at"],
                 ),
             )
             canonical_chapter_id = int(cursor.lastrowid)
@@ -1823,7 +1662,6 @@ class MySqlSourceRepository:
             """,
             (series_id, series_id),
         )
-        self._refresh_series_latest_chapter_cursor(cursor, series_id)
         self._mark_promotion_applied_cursor(
             cursor,
             queue["id"],
@@ -1839,37 +1677,6 @@ class MySqlSourceRepository:
             "canonical_chapter_id": canonical_chapter_id,
             "pages": len(pages),
         }
-
-    @staticmethod
-    def _refresh_series_latest_chapter_cursor(cursor, series_id: int) -> None:
-        """Keep the canonical latest-chapter pointer in sync with chapters."""
-        cursor.execute(
-            """
-            SELECT id
-            FROM chapters
-            WHERE series_id=%s AND deleted_at IS NULL
-            ORDER BY chapter_number DESC, created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (series_id,),
-        )
-        latest = cursor.fetchone()
-        if latest is None:
-            cursor.execute(
-                "DELETE FROM series_latest_chapters WHERE series_id=%s",
-                (series_id,),
-            )
-            return
-        cursor.execute(
-            """
-            INSERT INTO series_latest_chapters (series_id, latest_chapter_id)
-            VALUES (%s, %s)
-            ON DUPLICATE KEY UPDATE
-                latest_chapter_id=VALUES(latest_chapter_id),
-                updated_at=CURRENT_TIMESTAMP
-            """,
-            (series_id, latest["id"]),
-        )
 
     def _allocate_series_id_cursor(self, cursor) -> int:
         cursor.execute(
