@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
 
 from ..domain.models import (
     CanonicalSeries,
@@ -20,6 +21,17 @@ from .db import MySqlDatabase
 
 def _hash_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _normalize_chapter_number(value: object) -> Decimal | None:
+    """Return one numeric representation for values such as ``1`` and ``01``."""
+    if value is None:
+        return None
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return Decimal(format(number.normalize(), "f")) if number.is_finite() else None
 
 
 def _snapshot_payload(snapshot: SourceWorkSnapshot) -> dict:
@@ -102,7 +114,8 @@ class MySqlSourceRepository:
                       AND {work_alias}.canonical_series_id IS NOT NULL
                       AND fallback_work.canonical_series_id={work_alias}.canonical_series_id
                       AND {chapter_alias}.chapter_number IS NOT NULL
-                      AND fallback_chapter.chapter_number={chapter_alias}.chapter_number
+                      AND CAST(fallback_chapter.chapter_number AS DECIMAL(8,2)) =
+                          CAST({chapter_alias}.chapter_number AS DECIMAL(8,2))
                 )
             )
         """
@@ -650,7 +663,8 @@ class MySqlSourceRepository:
                           AND requested_work.canonical_series_id IS NOT NULL
                           AND candidate_work.canonical_series_id=requested_work.canonical_series_id
                           AND requested.chapter_number IS NOT NULL
-                          AND candidate.chapter_number=requested.chapter_number
+                          AND CAST(candidate.chapter_number AS DECIMAL(8,2)) =
+                              CAST(requested.chapter_number AS DECIMAL(8,2))
                         )
                       )
                     ORDER BY
@@ -725,7 +739,11 @@ class MySqlSourceRepository:
                     number = source_chapter["chapter_number"]
                     if number is None:
                         continue
-                    matches = [row for row in canonical_chapters if row["chapter_number"] == number]
+                    matches = [
+                        row
+                        for row in canonical_chapters
+                        if _normalize_chapter_number(row["chapter_number"]) == number
+                    ]
                     if len(matches) == 1:
                         cursor.execute(
                             """
@@ -1065,7 +1083,8 @@ class MySqlSourceRepository:
                           FROM chapters AS c
                           WHERE c.series_id=sw.canonical_series_id
                             AND c.deleted_at IS NULL
-                            AND c.chapter_number=sc.chapter_number
+                            AND CAST(c.chapter_number AS DECIMAL(8,2)) =
+                                CAST(sc.chapter_number AS DECIMAL(8,2))
                       )
                       {source_filter}
                     ORDER BY sc.last_seen_at DESC, sc.id DESC
@@ -1563,10 +1582,19 @@ class MySqlSourceRepository:
             """
             SELECT id, chapter_number, source_key
             FROM chapters
-            WHERE series_id=%s AND (chapter_ref_id=%s OR source_key=%s)
+            WHERE series_id=%s
+              AND (
+                  chapter_ref_id=%s
+                  OR source_key=%s
+                  OR (
+                      deleted_at IS NULL
+                      AND CAST(chapter_number AS DECIMAL(8,2)) =
+                          CAST(%s AS DECIMAL(8,2))
+                  )
+              )
             FOR UPDATE
             """,
-            (series_id, source_chapter_id, source_key),
+            (series_id, source_chapter_id, source_key, chapter["chapter_number"]),
         )
         existing_chapters = list(cursor.fetchall())
         if len(existing_chapters) > 1:
@@ -1574,7 +1602,9 @@ class MySqlSourceRepository:
 
         if existing_chapters:
             canonical_chapter_id = int(existing_chapters[0]["id"])
-            if existing_chapters[0]["chapter_number"] != chapter["chapter_number"]:
+            if _normalize_chapter_number(existing_chapters[0]["chapter_number"]) != _normalize_chapter_number(
+                chapter["chapter_number"]
+            ):
                 raise PromotionBlocked("existing canonical chapter number conflicts with source chapter")
         else:
             cursor.execute(
