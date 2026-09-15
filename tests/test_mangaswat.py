@@ -87,6 +87,42 @@ def _latest_release_card_payload():
     }
 
 
+def _current_appswat_release_card_payload():
+    """Shape observed from the live ``series/releases`` response."""
+    return {
+        "serie_id": 1702459,
+        "title": "Immortal's Way of Life",
+        "latest_chapter_updated_at": "2026-09-15T18:17:11.332077Z",
+        "slug": "immortals-way-of-life",
+        "type": {"id": 131, "name": "manhwa"},
+        "status": {"id": 79, "name": "ongoing"},
+        "genres": [{"id": 18, "name": "سحر"}],
+        "poster": {
+            "thumbnail": "https://appswat.com/v2/media/poster-thumbnail.webp",
+            "medium": "https://appswat.com/v2/media/poster-medium.webp",
+        },
+        "is_hot": False,
+        "views_count": 23513,
+        "rating": "7.0",
+        "chapters": [
+            {
+                "id": 1760552,
+                "title": "فصل 29",
+                "chapter": "29",
+                "created_at": "2026-09-15T18:17:11.33207+00:00",
+                "updated_at": "2026-09-15T18:17:11.332077+00:00",
+            },
+            {
+                "id": 1759913,
+                "title": "28",
+                "chapter": "28",
+                "created_at": "2026-09-09T08:43:41.492719+00:00",
+                "updated_at": "2026-09-09T08:43:41.492727+00:00",
+            },
+        ],
+    }
+
+
 def test_parse_series_preserves_manga_peak_identity_and_metadata():
     snapshot = MangaSwatAdapter()._parse_series(_series_payload())
 
@@ -276,3 +312,58 @@ def test_latest_feed_uses_apk_releases_endpoint_and_embedded_chapters():
         ("/chapters/104", Decimal("4"), "الفصل 4 - السابق"),
     ]
     assert [url for url, _ in adapter.requested_urls] == [releases_url]
+
+
+def test_latest_feed_parses_current_appswat_release_payload():
+    releases_url = (
+        "https://appswat.com/v2/api/v1/series/releases/?"
+        "page=1&page_size=100"
+    )
+    adapter = FakeMangaSwatAdapter(
+        {
+            releases_url: {
+                "count": 200,
+                "next": "https://appswat.com/v2/api/v1/series/releases/?page=2&page_size=100",
+                "previous": None,
+                "results": [_current_appswat_release_card_payload()],
+            }
+        }
+    )
+
+    feed = adapter.fetch_latest_page(1, limit=10)
+
+    assert feed.has_more is True
+    assert len(feed.works) == 1
+    work = feed.works[0]
+    assert work.source_work_key == "/series/1702459"
+    assert work.source_url == "https://meshmanga.com/series/immortals-way-of-life/"
+    assert work.title == "Immortal's Way of Life"
+    assert work.cover_url == "https://appswat.com/v2/media/poster-medium.webp"
+    assert work.tags == ("سحر",)
+    assert work.type_name == "manhwa"
+    assert work.payload["rating"] == "7.0"
+    assert [(chapter.number, chapter.label) for chapter in work.chapters] == [
+        (Decimal("29"), "فصل 29"),
+        (Decimal("28"), "28"),
+    ]
+    assert work.chapters[0].published_at is not None
+    assert work.chapters[0].published_at.tzinfo == timezone.utc
+    assert [url for url, _ in adapter.requested_urls] == [releases_url]
+
+
+def test_latest_feed_does_not_report_success_for_unparseable_cards():
+    releases_url = (
+        "https://appswat.com/v2/api/v1/series/releases/?"
+        "page=1&page_size=100"
+    )
+    adapter = FakeMangaSwatAdapter(
+        {releases_url: {"count": 1, "next": None, "results": [{"title": "unknown"}]}}
+    )
+
+    try:
+        adapter.fetch_latest_page(1, limit=10)
+    except RuntimeError as error:
+        assert "returned 1 cards" in str(error)
+        assert "none could be parsed" in str(error)
+    else:
+        raise AssertionError("unparseable Manga Swat cards must fail visibly")

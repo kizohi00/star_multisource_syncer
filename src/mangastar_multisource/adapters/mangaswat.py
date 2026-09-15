@@ -129,9 +129,9 @@ class MangaSwatAdapter(HtmlLatestAdapter):
 
         The Android APK names the route ``series/releases`` and deserializes
         each result with ``LatestReleaseSeriesCardSerializer``.  A card
-        contains the work identity plus ``latestReleasedChapters``; using
-        those chapter items directly avoids one chapter-list request per
-        work during polling.
+        contains the work identity plus its latest chapter items; using those
+        chapter items directly avoids one chapter-list request per work
+        during polling.
         """
         if page < 1:
             raise ValueError("page must be at least 1")
@@ -143,8 +143,10 @@ class MangaSwatAdapter(HtmlLatestAdapter):
         results = self._results(payload)
         works: list[SourceWorkSnapshot] = []
         seen: set[str] = set()
+        skipped_cards = 0
         for item in results:
             if not isinstance(item, Mapping):
+                skipped_cards += 1
                 continue
             try:
                 work = self._parse_latest_release_card(
@@ -153,6 +155,7 @@ class MangaSwatAdapter(HtmlLatestAdapter):
                     page=page,
                 )
             except (TypeError, ValueError, KeyError):
+                skipped_cards += 1
                 continue
             if work.source_work_key in seen:
                 continue
@@ -161,6 +164,12 @@ class MangaSwatAdapter(HtmlLatestAdapter):
             works.append(work)
             if len(works) >= limit:
                 break
+
+        if results and not works:
+            raise RuntimeError(
+                f"{self.display_name} latest page {page} returned {len(results)} cards, "
+                f"but none could be parsed ({skipped_cards} skipped)"
+            )
 
         has_more = self._has_more(payload, results)
         next_cursor = self._next_cursor(payload)
@@ -347,17 +356,23 @@ class MangaSwatAdapter(HtmlLatestAdapter):
     ) -> SourceWorkSnapshot:
         """Convert the APK's ``LatestReleaseSeriesCard`` to a Star snapshot.
 
-        These field names are taken from the APK's serializers/models:
-        ``seriesId``, ``name``, ``slug``, ``poster``, ``rate``, ``type``,
-        ``status``, and ``latestReleasedChapters``.
+        The APK model names are ``seriesId``, ``name``, and
+        ``latestReleasedChapters``.  The live endpoint currently exposes the
+        equivalent fields as ``serie_id``, ``title``, and ``chapters``.  Keep
+        both forms here because the endpoint has changed its wire names while
+        retaining the same route and pagination envelope.
         """
         series_id = self._coerce_int(item.get("seriesId"))
+        if series_id is None:
+            series_id = self._coerce_int(item.get("serie_id"))
         if series_id is None:
             raise ValueError("Manga Swat release card has no seriesId")
 
         raw_chapters = item.get("latestReleasedChapters")
         if not isinstance(raw_chapters, list):
-            raise ValueError("Manga Swat release card has no latestReleasedChapters list")
+            raw_chapters = item.get("chapters")
+        if not isinstance(raw_chapters, list):
+            raise ValueError("Manga Swat release card has no latest chapters list")
         chapters = tuple(
             chapter
             for raw_chapter in raw_chapters
@@ -372,13 +387,14 @@ class MangaSwatAdapter(HtmlLatestAdapter):
         # card.  Full metadata is still refreshed by fetch_work_details().
         series_record: dict[str, object] = {
             "id": series_id,
-            "title": item.get("name"),
+            "title": item.get("name") or item.get("title"),
             "slug": item.get("slug"),
             "poster": item.get("poster"),
-            "rating": item.get("rate"),
+            "rating": item.get("rate") if item.get("rate") is not None else item.get("rating"),
             "type": item.get("type"),
             "status": item.get("status"),
-            "views": item.get("views"),
+            "views": item.get("views") if item.get("views") is not None else item.get("views_count"),
+            "genres": item.get("genres"),
         }
         return self._parse_series(
             series_record,
@@ -393,11 +409,11 @@ class MangaSwatAdapter(HtmlLatestAdapter):
         item: Mapping[str, object],
     ) -> SourceChapterSnapshot | None:
         """Parse the APK's ``LatestReleaseSeriesChapterItem`` model."""
-        chapter_id = str(item.get("id") or "").strip()
+        chapter_id = str(item.get("id") or item.get("chapterId") or "").strip()
         if not chapter_id:
             return None
 
-        raw_number = str(item.get("chapter") or "").strip()
+        raw_number = str(item.get("chapter") or item.get("number") or "").strip()
         number = parse_chapter_number(raw_number)
         title = str(item.get("title") or "").strip() or None
         label = (
@@ -412,8 +428,9 @@ class MangaSwatAdapter(HtmlLatestAdapter):
             label=label,
             number=number,
             title=title,
-            # The APK's release-item serializer exposes no release timestamp;
-            # do not invent one from the polling time or list order.
+            published_at=self._created_at(
+                item.get("updated_at") or item.get("created_at")
+            ),
         )
 
     def _parse_series(

@@ -29,13 +29,16 @@ GET https://appswat.com/v2/api/v1/series/releases/?page={page}&page_size=100
 | `Lvc/y.toString()` | `SeriesLatestReleases` |
 | تدفق الشاشة الرئيسية `Lkf/a` | يستدعي `Lvc/y` |
 | serializer الممرر للتدفق | `LatestReleaseSeriesCardSerializer` |
-| envelope `Lyc/a` | `count`, `next`, `prev`, `results` |
-| بطاقة العمل | `seriesId`, `name`, `slug`, `poster`, `latestReleasedChapters` |
-| الفصل المضمّن | `id`, `chapter`, `title`, `numberWithTitle` |
+| envelope `Lyc/a` | `count`, `next`, `prev`/`previous`, `results` |
+| بطاقة العمل في نموذج APK | `seriesId`, `name`, `slug`, `poster`, `latestReleasedChapters` |
+| بطاقة العمل في الاستجابة الحالية | `serie_id`, `title`, `slug`, `poster`, `chapters`, `rating`, `views_count` |
+| الفصل المضمّن في نموذج APK | `id`, `chapter`, `title`, `numberWithTitle` |
+| الفصل في الاستجابة الحالية | `id`, `chapter`, `title`, `created_at`, `updated_at` |
 
-لا يضيف المصدر وقتاً مصطنعاً للفصل، لأن نموذج الفصل المضمّن في الـAPK لا
-يحتوي على حقل timestamp. يتم حفظ رقم الفصل ومعرّفه والرابط العام، وتبقى
-بيانات التفاصيل والتاريخ الكامل من مسارات الـparser الأصلية.
+لا يضيف المصدر وقتاً مصطنعاً للفصل. إذا أعاد endpoint الحالي
+`created_at`/`updated_at` تُحفظ قيمة التاريخ الحقيقية، أما نموذج الفصل
+المضمّن في الـAPK إذا خلا من timestamp فيبقى التاريخ فارغاً إلى أن يجلبه
+enrichment من المسار الكامل.
 
 ## فصل المسارات
 
@@ -47,5 +50,5 @@ GET https://appswat.com/v2/api/v1/series/releases/?page={page}&page_size=100
   عمل محدد.
 - `https://appswat.com/v2/api/v2/chapters/{id}/`: صور صفحات الفصل.
 
-اختبار `tests/test_mangaswat.py` يثبت أن polling يطلب endpoint الأول مرة
+اختبارات `tests/test_mangaswat.py` تثبت أن polling يطلب endpoint الأول مرة
 واحدة ويحوّل الفصول المضمّنة دون تنفيذ طلب chapters إضافي لكل بطاقة.

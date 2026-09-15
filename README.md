@@ -43,16 +43,17 @@ MANGA_SYNC_DB_NAME=zhffrycs_star_sync_copy
 ## ملاحظات المصادر
 
 - MangaTek قد يرجع `403`؛ يتم تسجيله كمصدر متعذر دون إيقاف المصادر الأخرى.
-- Manga Swat (`mangaswat`) يستخدم واجهة AppSwat الموجودة في `appswat.com`، مع روابط الأعمال والفصول العامة على `meshmanga.com`. يُحفظ المعرّف الرقمي للـ API كهوية العمل، ويُحفظ الـ slug كرابط عام. أثناء polling يستخدم المصدر endpoint تطبيق Manga Swat الموثّق لقسم «أحدث الفصول»: `https://appswat.com/v2/api/v1/series/releases/?page={page}&page_size=100`. تعيد الاستجابة بطاقات أعمال تحتوي `seriesId` و`name` و`slug` و`poster` و`latestReleasedChapters`، لذلك لا يجري فحص فصل منفصل لكل عمل. تبقى صفحة الفهرس للبحث عن المعرّف عند الحاجة، بينما يجلب enrichment قائمة الفصول الكاملة من endpoint الصفحات المتعددة.
+- Manga Swat (`mangaswat`) يستخدم واجهة AppSwat الموجودة في `appswat.com`، مع روابط الأعمال والفصول العامة على `meshmanga.com`. يُحفظ المعرّف الرقمي للـ API كهوية العمل، ويُحفظ الـ slug كرابط عام. أثناء polling يستخدم المصدر endpoint تطبيق Manga Swat الموثّق لقسم «أحدث الفصول»: `https://appswat.com/v2/api/v1/series/releases/?page={page}&page_size=100`. envelope الاستجابة هو `count`/`next`/`previous`/`results`، والبطاقة الحالية تعرض `serie_id` و`title` و`slug` و`poster` و`rating` و`views_count` و`chapters`؛ كما يدعم parser أسماء نموذج الـ APK القديمة (`seriesId`/`name`/`latestReleasedChapters`) للتوافق. تُستخدم الفصول المضمّنة أثناء polling، ثم يجلب enrichment قائمة الفصول الكاملة من endpoint الصفحات المتعددة.
 - الفصول المقفلة لا تُكسر. يبحث النظام عن نسخة متاحة في مصدر آخر ويراجع الفصل المقفل عند ظهور ملاحظة أحدث ذات صلة.
 
 ### توثيق endpoint أحدث الفصول في Manga Swat
 
-تم تحديد endpoint أعلاه من نسخة APK الخاصة بـ Manga Swat، وليس من تخمين اسم القسم أو ترتيب قائمة الأعمال. نقاط التحقق التي يعتمد عليها الكود:
+تم تحديد endpoint أعلاه من نسخة APK الخاصة بـ Manga Swat، ثم قورنت استجابته الفعلية بعقد parser قبل اعتماده. نقاط التحقق التي يعتمد عليها الكود:
 
 - واصف المسار `Lvc/y` يحتوي القيمة `series/releases`، واسمه النصي داخل التطبيق `SeriesLatestReleases`.
 - تدفق الشاشة الرئيسية `Lkf/a` يستدعي هذا الواصف، ثم يمرر serializer باسم `LatestReleaseSeriesCardSerializer`.
-- نموذج البطاقة يعرّف الحقول `seriesId` و`name` و`slug` و`poster` و`latestReleasedChapters`.
+- نموذج APK يعرّف الحقول `seriesId` و`name` و`slug` و`poster` و`latestReleasedChapters`.
+- الاستجابة الحالية التي يعيدها الخادم تستخدم الحقول المكافئة `serie_id` و`title` و`slug` و`poster` و`chapters`، مع `rating` و`views_count`.
 - نموذج الفصل المضمّن `LatestReleaseSeriesChapterItem` يعرّف `id` و`chapter` و`title` و`numberWithTitle`.
 - طبقة الـ paging في الـAPK تضيف `page` و`page_size`، وتبدأ الصفحة الأولى بقيمة `page_size=100`.
 - المسار `/v2/api/v2/series/` يبقى لمسار الفهرس/التفاصيل السابق، وليس مصدر قسم «أحدث الفصول».
