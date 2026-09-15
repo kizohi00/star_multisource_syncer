@@ -7,6 +7,7 @@ from ..domain.ports import SourceAdapter
 from .azorafly import AzoraFlyAdapter
 from .madara import AsqAdapter, SparkMangaAdapter
 from .mangatek import MangaTekAdapter
+from .mangaswat import MangaSwatAdapter
 from .teamx import TeamXNovelAdapter
 
 
@@ -20,6 +21,10 @@ def build_adapters(settings: Settings) -> tuple[SourceAdapter, ...]:
             cookie=settings.mangatek_cookie,
         ),
         SparkMangaAdapter(
+            timeout_seconds=settings.http_timeout_seconds,
+            user_agent=settings.http_user_agent,
+        ),
+        MangaSwatAdapter(
             timeout_seconds=settings.http_timeout_seconds,
             user_agent=settings.http_user_agent,
         ),
