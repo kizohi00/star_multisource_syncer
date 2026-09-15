@@ -367,3 +367,15 @@ def test_latest_feed_does_not_report_success_for_unparseable_cards():
         assert "none could be parsed" in str(error)
     else:
         raise AssertionError("unparseable Manga Swat cards must fail visibly")
+
+
+def test_latest_chapter_title_is_reduced_to_number_when_it_contains_series_title():
+    chapter = MangaSwatAdapter()._parse_latest_release_chapter(
+        {"id": 64, "chapter": "64", "title": "الفصل 64 من Hunter x Hunter"},
+        series_title="Hunter x Hunter",
+    )
+
+    assert chapter is not None
+    assert chapter.number == Decimal("64")
+    assert chapter.title is None
+    assert chapter.label == "64"

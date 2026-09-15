@@ -377,7 +377,12 @@ class MangaSwatAdapter(HtmlLatestAdapter):
             chapter
             for raw_chapter in raw_chapters
             if isinstance(raw_chapter, Mapping)
-            for chapter in (self._parse_latest_release_chapter(raw_chapter),)
+            for chapter in (
+                self._parse_latest_release_chapter(
+                    raw_chapter,
+                    series_title=str(item.get("name") or item.get("title") or ""),
+                ),
+            )
             if chapter is not None
         )
         if not chapters:
@@ -407,6 +412,8 @@ class MangaSwatAdapter(HtmlLatestAdapter):
     def _parse_latest_release_chapter(
         self,
         item: Mapping[str, object],
+        *,
+        series_title: str = "",
     ) -> SourceChapterSnapshot | None:
         """Parse the APK's ``LatestReleaseSeriesChapterItem`` model."""
         chapter_id = str(item.get("id") or item.get("chapterId") or "").strip()
@@ -416,10 +423,20 @@ class MangaSwatAdapter(HtmlLatestAdapter):
         raw_number = str(item.get("chapter") or item.get("number") or "").strip()
         number = parse_chapter_number(raw_number)
         title = str(item.get("title") or "").strip() or None
+        contains_series_title = bool(
+            title and series_title and series_title.casefold() in title.casefold()
+        )
+        if contains_series_title:
+            title = None
         label = (
-            str(item.get("numberWithTitle") or "").strip()
-            or title
-            or (f"Chapter {raw_number}" if raw_number else f"Chapter {chapter_id}")
+            raw_number
+            if contains_series_title and raw_number
+            else (
+                str(item.get("numberWithTitle") or "").strip()
+                or title
+                or raw_number
+                or f"Chapter {chapter_id}"
+            )
         )
         url = f"{self.base_url}/chapters/{quote(chapter_id, safe='')}"
         return SourceChapterSnapshot(
