@@ -1,1 +1,1 @@
-"""Application services orchestrating adapters and repositories."""
+"""Domain objects and ports."""

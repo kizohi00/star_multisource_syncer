@@ -1,1 +1,1 @@
-"""Source adapters for update feeds."""
+"""Matching and verification policies."""

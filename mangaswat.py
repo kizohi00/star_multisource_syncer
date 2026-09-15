@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.parse import parse_qs, quote, quote_plus, urlparse
@@ -39,12 +38,18 @@ class MangaSwatAdapter(HtmlLatestAdapter):
     display_name = "Manga Swat"
     base_url = "https://meshmanga.com"
     latest_url = "https://meshmanga.com/"
+    # The Manga Swat Android app builds this route from the AppSwat API root
+    # (``https://appswat.com/v2/api``), the ``v1/`` route namespace, and the
+    # ``series/releases`` route descriptor.  The older v2 API remains the
+    # source of the parser's detail/chapter/page endpoints below.
+    latest_api_base_url = "https://appswat.com/v2/api/v1"
     api_base_url = "https://appswat.com/v2/api/v2"
 
     _API_ACCEPT = "application/json, text/plain, */*"
     _API_ORIGIN = "https://meshmanga.com"
     _API_REFERER = "https://meshmanga.com/"
     _DEFAULT_PARSER_USER_AGENT = "ktor-client"
+    _LATEST_PAGE_SIZE = 100
     _MAX_CHAPTER_PAGES = 1000
 
     def __init__(
@@ -52,10 +57,8 @@ class MangaSwatAdapter(HtmlLatestAdapter):
         *,
         timeout_seconds: int = 25,
         user_agent: str = _DEFAULT_PARSER_USER_AGENT,
-        probe_latest_chapters: bool = False,
     ) -> None:
         super().__init__(timeout_seconds=timeout_seconds, user_agent=user_agent)
-        self.probe_latest_chapters = probe_latest_chapters
         self._csrf_lock = threading.Lock()
         self._csrf_token_value: str | None = None
         self._series_cache_lock = threading.Lock()
@@ -122,19 +125,20 @@ class MangaSwatAdapter(HtmlLatestAdapter):
             raise RuntimeError(f"{self.display_name} returned invalid JSON: {url}") from exc
 
     def fetch_latest_page(self, page: int, *, limit: int) -> LatestFeedSnapshot:
-        """Fetch one catalog page, matching Manga Peak's ``getListPage``.
+        """Fetch one page of the APK's ``latest chapters`` feed.
 
-        Manga Peak's catalog records do not carry chapter objects.  The
-        optional ``probe_latest_chapters`` mode adds the newest chapter from
-        the same API so Star can detect updates during polling; full chapter
-        history is always fetched by ``fetch_work_details`` during enrichment.
+        The Android APK names the route ``series/releases`` and deserializes
+        each result with ``LatestReleaseSeriesCardSerializer``.  A card
+        contains the work identity plus ``latestReleasedChapters``; using
+        those chapter items directly avoids one chapter-list request per
+        work during polling.
         """
         if page < 1:
             raise ValueError("page must be at least 1")
         if limit < 1:
             raise ValueError("limit must be at least 1")
 
-        feed_url = self._catalog_url(page)
+        feed_url = self._latest_releases_url(page)
         payload = self._get_json(feed_url)
         results = self._results(payload)
         works: list[SourceWorkSnapshot] = []
@@ -143,15 +147,17 @@ class MangaSwatAdapter(HtmlLatestAdapter):
             if not isinstance(item, Mapping):
                 continue
             try:
-                work = self._parse_series(item, feed_url=feed_url, page=page)
+                work = self._parse_latest_release_card(
+                    item,
+                    feed_url=feed_url,
+                    page=page,
+                )
             except (TypeError, ValueError, KeyError):
                 continue
             if work.source_work_key in seen:
                 continue
             seen.add(work.source_work_key)
             self._cache_series_id(work.source_url, work.payload.get("api_id"))
-            if self.probe_latest_chapters:
-                work = self._with_latest_chapter_probe(work)
             works.append(work)
             if len(works) >= limit:
                 break
@@ -297,6 +303,13 @@ class MangaSwatAdapter(HtmlLatestAdapter):
     def _catalog_url(self, page: int) -> str:
         return self.build_catalog_url(page)
 
+    def _latest_releases_url(self, page: int) -> str:
+        """Build the exact paginated request used by the APK home feed."""
+        return (
+            f"{self.latest_api_base_url}/series/releases/?"
+            f"page={page}&page_size={self._LATEST_PAGE_SIZE}"
+        )
+
     def _fetch_chapters(self, series_id: str) -> tuple[SourceChapterSnapshot, ...]:
         chapters: list[SourceChapterSnapshot] = []
         page = 1
@@ -325,22 +338,83 @@ class MangaSwatAdapter(HtmlLatestAdapter):
             raise RuntimeError(f"{self.display_name} chapter pagination exceeded safety limit")
         return tuple(chapters)
 
-    def _with_latest_chapter_probe(self, work: SourceWorkSnapshot) -> SourceWorkSnapshot:
-        series_id = self._api_series_id_for_work(work)
-        if not series_id:
-            return work
-        try:
-            chapters = self._fetch_chapters(series_id)
-        except Exception as exc:
-            payload = dict(work.payload)
-            payload["latest_chapter_probe_error"] = f"{type(exc).__name__}: {exc}"
-            return replace(work, payload=payload)
+    def _parse_latest_release_card(
+        self,
+        item: Mapping[str, object],
+        *,
+        feed_url: str,
+        page: int,
+    ) -> SourceWorkSnapshot:
+        """Convert the APK's ``LatestReleaseSeriesCard`` to a Star snapshot.
+
+        These field names are taken from the APK's serializers/models:
+        ``seriesId``, ``name``, ``slug``, ``poster``, ``rate``, ``type``,
+        ``status``, and ``latestReleasedChapters``.
+        """
+        series_id = self._coerce_int(item.get("seriesId"))
+        if series_id is None:
+            raise ValueError("Manga Swat release card has no seriesId")
+
+        raw_chapters = item.get("latestReleasedChapters")
+        if not isinstance(raw_chapters, list):
+            raise ValueError("Manga Swat release card has no latestReleasedChapters list")
+        chapters = tuple(
+            chapter
+            for raw_chapter in raw_chapters
+            if isinstance(raw_chapter, Mapping)
+            for chapter in (self._parse_latest_release_chapter(raw_chapter),)
+            if chapter is not None
+        )
         if not chapters:
-            return work
-        latest = max(chapters, key=self._chapter_sort_key)
-        payload = dict(work.payload)
-        payload["latest_chapter_probe"] = True
-        return replace(work, chapters=(latest,), payload=payload)
+            raise ValueError("Manga Swat release card has no usable latest chapter")
+
+        # Normalize only fields that are explicitly exposed by the release
+        # card.  Full metadata is still refreshed by fetch_work_details().
+        series_record: dict[str, object] = {
+            "id": series_id,
+            "title": item.get("name"),
+            "slug": item.get("slug"),
+            "poster": item.get("poster"),
+            "rating": item.get("rate"),
+            "type": item.get("type"),
+            "status": item.get("status"),
+            "views": item.get("views"),
+        }
+        return self._parse_series(
+            series_record,
+            feed_url=feed_url,
+            page=page,
+            chapters=chapters,
+            feed_kind="series_releases",
+        )
+
+    def _parse_latest_release_chapter(
+        self,
+        item: Mapping[str, object],
+    ) -> SourceChapterSnapshot | None:
+        """Parse the APK's ``LatestReleaseSeriesChapterItem`` model."""
+        chapter_id = str(item.get("id") or "").strip()
+        if not chapter_id:
+            return None
+
+        raw_number = str(item.get("chapter") or "").strip()
+        number = parse_chapter_number(raw_number)
+        title = str(item.get("title") or "").strip() or None
+        label = (
+            str(item.get("numberWithTitle") or "").strip()
+            or title
+            or (f"Chapter {raw_number}" if raw_number else f"Chapter {chapter_id}")
+        )
+        url = f"{self.base_url}/chapters/{quote(chapter_id, safe='')}"
+        return SourceChapterSnapshot(
+            source_chapter_key=path_key(url),
+            source_url=url,
+            label=label,
+            number=number,
+            title=title,
+            # The APK's release-item serializer exposes no release timestamp;
+            # do not invent one from the polling time or list order.
+        )
 
     def _parse_series(
         self,
@@ -350,6 +424,7 @@ class MangaSwatAdapter(HtmlLatestAdapter):
         feed_url: str | None = None,
         page: int | None = None,
         chapters: Sequence[SourceChapterSnapshot] = (),
+        feed_kind: str | None = None,
     ) -> SourceWorkSnapshot:
         api_id = self._coerce_int(item.get("id")) or self._coerce_int(item.get("serie_id"))
         slug = str(item.get("slug") or "").strip().strip("/")
@@ -399,7 +474,7 @@ class MangaSwatAdapter(HtmlLatestAdapter):
             or ""
         )
         summary = clean_html_text(summary_value) or None
-        type_value = str(item.get("type") or item.get("format") or "").strip() or None
+        type_value = self._named_value(item.get("type") or item.get("format"))
         payload: dict[str, object] = {
             "adapter": "manga_peak.mangaswat",
             "api_id": api_id,
@@ -415,6 +490,8 @@ class MangaSwatAdapter(HtmlLatestAdapter):
             payload["feed_url"] = feed_url
         if page is not None:
             payload["page"] = page
+        if feed_kind:
+            payload["feed_kind"] = feed_kind
 
         return SourceWorkSnapshot(
             source_key=self.key,
@@ -483,16 +560,6 @@ class MangaSwatAdapter(HtmlLatestAdapter):
                 return item_id
         return None
 
-    def _api_series_id_for_work(self, work: SourceWorkSnapshot) -> str:
-        payload_id = self._coerce_int(work.payload.get("api_id"))
-        if payload_id is not None:
-            return str(payload_id)
-        cached_id = self._cached_series_id(work.source_url)
-        if cached_id is not None:
-            return str(cached_id)
-        source_ref = self._series_id_from_url(work.source_url)
-        return source_ref if self._coerce_int(source_ref) is not None else ""
-
     def _cache_series_id(self, source_url: str, value: object) -> None:
         series_id = self._coerce_int(value)
         if series_id is None:
@@ -551,9 +618,14 @@ class MangaSwatAdapter(HtmlLatestAdapter):
 
     @staticmethod
     def _status_name(value: object) -> str | None:
+        name = MangaSwatAdapter._named_value(value)
+        return name.casefold() if name else None
+
+    @staticmethod
+    def _named_value(value: object) -> str | None:
         if isinstance(value, Mapping):
             value = value.get("name")
-        name = str(value or "").strip().casefold()
+        name = str(value or "").strip()
         return name or None
 
     @staticmethod
@@ -602,9 +674,3 @@ class MangaSwatAdapter(HtmlLatestAdapter):
         if name not in {"relevance", "popularity", "rating"}:
             raise ValueError(f"Unsupported Manga Swat sort order: {value}")
         return name
-
-    @staticmethod
-    def _chapter_sort_key(chapter: SourceChapterSnapshot) -> tuple[bool, Decimal, float]:
-        number = chapter.number if chapter.number is not None else Decimal("-Infinity")
-        published = chapter.published_at.timestamp() if chapter.published_at else float("-inf")
-        return chapter.number is not None, number, published

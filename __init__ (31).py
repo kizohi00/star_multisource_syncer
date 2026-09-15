@@ -1,1 +1,1 @@
-"""Packaged database migrations."""
+"""Source adapters for update feeds."""

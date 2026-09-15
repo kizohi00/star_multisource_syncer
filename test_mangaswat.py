@@ -56,6 +56,37 @@ def _series_payload():
     }
 
 
+def _latest_release_card_payload():
+    """Fields exposed by the APK's LatestReleaseSeriesCard serializer."""
+    return {
+        "seriesId": 42,
+        "name": "  العمل التجريبي  ",
+        "slug": "demo-work",
+        "rate": 4.75,
+        "type": {"id": 1, "name": "MANGA"},
+        "status": {"id": 2, "name": "ONGOING"},
+        "views": 1234,
+        "poster": {
+            "thumbnail": "/media/demo-thumb.jpg",
+            "medium": "/media/demo-medium.jpg",
+        },
+        "latestReleasedChapters": [
+            {
+                "id": 105,
+                "chapter": "5",
+                "title": "الأحدث",
+                "numberWithTitle": "الفصل 5 - الأحدث",
+            },
+            {
+                "id": 104,
+                "chapter": "4",
+                "title": "السابق",
+                "numberWithTitle": "الفصل 4 - السابق",
+            },
+        ],
+    }
+
+
 def test_parse_series_preserves_manga_peak_identity_and_metadata():
     snapshot = MangaSwatAdapter()._parse_series(_series_payload())
 
@@ -215,28 +246,33 @@ def test_csrf_token_is_cached_and_post_headers_match_parser():
     assert len(adapter.requested_urls) == 1
 
 
-def test_latest_probe_adds_newest_chapter_without_changing_work_identity():
-    catalog_url = "https://appswat.com/v2/api/v2/series/?page=1"
-    chapter_url = (
-        "https://appswat.com/v2/api/v2/chapters/?"
-        "serie=42&order_by=order&page_size=200&page=1"
+def test_latest_feed_uses_apk_releases_endpoint_and_embedded_chapters():
+    releases_url = (
+        "https://appswat.com/v2/api/v1/series/releases/?"
+        "page=1&page_size=100"
     )
     adapter = FakeMangaSwatAdapter(
         {
-            catalog_url: {"results": [_series_payload()]},
-            chapter_url: {
-                "results": [
-                    {"id": 105, "chapter": "5", "title": "الأحدث"},
-                ],
-                "next": None,
-            },
-        },
-        probe_latest_chapters=True,
+            releases_url: {
+                "count": 1,
+                "next": "https://appswat.com/v2/api/v1/series/releases/?page=2&page_size=100",
+                "prev": None,
+                "results": [_latest_release_card_payload()],
+            }
+        }
     )
 
     feed = adapter.fetch_latest_page(1, limit=10)
 
     assert feed.has_more is True
+    assert feed.next_cursor.endswith("page=2&page_size=100")
     assert feed.works[0].source_work_key == "/series/42"
-    assert feed.works[0].chapters[0].source_chapter_key == "/chapters/105"
-    assert feed.works[0].payload["latest_chapter_probe"] is True
+    assert feed.works[0].title == "العمل التجريبي"
+    assert feed.works[0].cover_url == "https://meshmanga.com/media/demo-medium.jpg"
+    assert feed.works[0].type_name == "MANGA"
+    assert feed.works[0].payload["feed_kind"] == "series_releases"
+    assert [(chapter.source_chapter_key, chapter.number, chapter.label) for chapter in feed.works[0].chapters] == [
+        ("/chapters/105", Decimal("5"), "الفصل 5 - الأحدث"),
+        ("/chapters/104", Decimal("4"), "الفصل 4 - السابق"),
+    ]
+    assert [url for url, _ in adapter.requested_urls] == [releases_url]
