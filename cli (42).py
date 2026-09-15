@@ -20,11 +20,6 @@ from .matching.metadata import MetadataMatcher
 MIGRATIONS = Path(__file__).resolve().parent / "migrations"
 
 
-def _log(message: str) -> None:
-    """Write an immediately visible worker status line for hosted logs."""
-    print(f"[mangastar-syncer] {message}", flush=True)
-
-
 def configure_utf8_stdio() -> None:
     """Keep JSON output usable on Windows terminals with a legacy code page."""
     for stream in (sys.stdout, sys.stderr):
@@ -99,32 +94,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     configure_utf8_stdio()
     args = build_parser().parse_args(argv)
-    if args.command == "worker":
-        _log("worker command received")
     if args.env_file is not None:
         load_local_env(args.env_file)
     settings = Settings.from_env()
     settings.validate()
-    if args.command == "worker":
-        _log(
-            "configuration validated; content_database="
-            f"{settings.db_name}; sync_database={settings.effective_sync_db_name}"
-        )
     database = MySqlDatabase(settings)
     repository = MySqlSourceRepository(database)
 
     if args.command == "migrate":
         applied = database.apply_migrations(MIGRATIONS)
-        print(
-            json.dumps(
-                {
-                    "content_database": settings.db_name,
-                    "sync_database": settings.effective_sync_db_name,
-                    "applied": applied,
-                },
-                ensure_ascii=False,
-            )
-        )
+        print(json.dumps({"database": settings.db_name, "applied": applied}, ensure_ascii=False))
         return
 
     if args.command == "inspect":
@@ -132,26 +111,14 @@ def main(argv: list[str] | None = None) -> None:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT DATABASE() AS database_name, VERSION() AS version")
                 connection_info = cursor.fetchone()
-        print(
-            json.dumps(
-                {
-                    "connection": connection_info,
-                    "content_database": settings.db_name,
-                    "sync_database": settings.effective_sync_db_name,
-                    "pipeline": repository.counts(),
-                },
-                ensure_ascii=False,
-                default=str,
-            )
-        )
+        print(json.dumps({"connection": connection_info, "pipeline": repository.counts()}, ensure_ascii=False, default=str))
         return
 
     if args.command == "monitor":
         print(
             json.dumps(
                 {
-                    "content_database": settings.db_name,
-                    "sync_database": settings.effective_sync_db_name,
+                    "database": settings.db_name,
                     "sources": repository.source_health(set(args.sources or [])),
                 },
                 ensure_ascii=False,
@@ -170,8 +137,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         else:
             result = {
-                "content_database": settings.db_name,
-                "sync_database": settings.effective_sync_db_name,
+                "database": settings.db_name,
                 "status": args.status,
                 "proposals": repository.list_promotion_queue(
                     status=args.status,
@@ -215,11 +181,6 @@ def main(argv: list[str] | None = None) -> None:
     all_adapters = build_adapters(settings)
     adapters = select_adapters(all_adapters, set(args.sources or []))
     if args.command == "worker":
-        _log(
-            "worker initialized; sources="
-            + ",".join(adapter.key for adapter in adapters)
-            + f"; once={args.once}"
-        )
         poll_service = LatestFeedService(
             repository,
             MetadataMatcher(auto_threshold=settings.auto_match_threshold, margin=settings.match_margin),
@@ -229,8 +190,6 @@ def main(argv: list[str] | None = None) -> None:
             max_pages_per_source=(
                 settings.latest_max_pages_per_source if args.max_pages is None else args.max_pages
             ),
-            backfill_enabled=settings.backfill_enabled,
-            backfill_interval_seconds=settings.backfill_interval_seconds,
         )
         enrichment_service = WorkEnrichmentService(
             repository,
@@ -259,9 +218,8 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
         if args.once:
-            _log("cycle started")
             result = worker.run_once()
-            print(json.dumps(result.as_dict(), ensure_ascii=False), flush=True)
+            print(json.dumps(result.as_dict(), ensure_ascii=False))
             if result.error or (
                 not args.allow_source_failures
                 and any(item.status == "failed" for item in result.poll_results)
@@ -317,8 +275,6 @@ def main(argv: list[str] | None = None) -> None:
         max_pages_per_source=(
             settings.latest_max_pages_per_source if args.max_pages is None else args.max_pages
         ),
-        backfill_enabled=settings.backfill_enabled,
-        backfill_interval_seconds=settings.backfill_interval_seconds,
     )
     results = service.poll(adapters, limit=args.limit or settings.max_latest_items)
     print(json.dumps([result.__dict__ for result in results], ensure_ascii=False))
