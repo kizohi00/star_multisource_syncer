@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from collections.abc import Sequence
 
 from bs4 import BeautifulSoup
@@ -260,7 +262,66 @@ class MySqlSourceRepository:
                 """,
                 (effective_match.canonical_series_id, effective_match.score, source_work_id),
             )
+        canonical_series_id = row["canonical_series_id"] or effective_match.canonical_series_id
+        source_story_status = self._source_story_status(snapshot)
+        if canonical_series_id is not None and source_story_status is not None:
+            cursor.execute(
+                """
+                UPDATE series
+                SET story_status=%s
+                WHERE id=%s
+                  AND (story_status IS NULL OR story_status<>%s)
+                """,
+                (source_story_status, int(canonical_series_id), source_story_status),
+            )
         return source_work_id
+
+    @staticmethod
+    def _source_story_status(snapshot: SourceWorkSnapshot) -> str | None:
+        """Translate source status labels to Manga Star's three statuses.
+
+        ``story_status`` is intentionally used for the source translation
+        state in the current Manga Star schema.  ``translation_status`` is a
+        legacy/unused column and must never be changed by the syncer.
+        """
+        payload_status = snapshot.payload.get("status")
+        if isinstance(payload_status, dict):
+            payload_status = (
+                payload_status.get("name")
+                or payload_status.get("title")
+                or payload_status.get("label")
+                or payload_status.get("value")
+            )
+        status = unicodedata.normalize("NFKC", str(payload_status or ""))
+        status = "".join(char for char in status if not unicodedata.combining(char))
+        status = re.sub(r"[\u0640\u200e\u200f_-]+", " ", status)
+        status = " ".join(status.casefold().split())
+        aliases = {
+            "ongoing": "ongoing",
+            "on going": "ongoing",
+            "in progress": "ongoing",
+            "مستمر": "ongoing",
+            "مستمرة": "ongoing",
+            "جار": "ongoing",
+            "جاري": "ongoing",
+            "جارية": "ongoing",
+            "completed": "completed",
+            "complete": "completed",
+            "finished": "completed",
+            "مكتمل": "completed",
+            "مكتملة": "completed",
+            "منتهي": "completed",
+            "منتهية": "completed",
+            "منته": "completed",
+            "hiatus": "hiatus",
+            "paused": "hiatus",
+            "on hold": "hiatus",
+            "متوقف": "hiatus",
+            "متوقفة": "hiatus",
+            "في استراحة": "hiatus",
+            "استراحة": "hiatus",
+        }
+        return aliases.get(status)
 
     @staticmethod
     def _find_exact_title_series_cursor(cursor, title: object) -> dict | None:

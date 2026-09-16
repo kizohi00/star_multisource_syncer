@@ -2,7 +2,8 @@ from datetime import timezone
 from decimal import Decimal
 
 from mangastar_multisource.adapters.mangaswat import MangaSwatAdapter
-from mangastar_multisource.domain.models import SourceChapterSnapshot
+from mangastar_multisource.domain.models import SourceChapterSnapshot, SourceWorkSnapshot
+from mangastar_multisource.infrastructure.repositories import MySqlSourceRepository
 
 
 class FakeResponse:
@@ -379,3 +380,23 @@ def test_latest_chapter_title_is_reduced_to_number_when_it_contains_series_title
     assert chapter.number == Decimal("64")
     assert chapter.title is None
     assert chapter.label == "64"
+
+
+def test_source_story_status_accepts_only_the_three_supported_values():
+    def snapshot(status):
+        return SourceWorkSnapshot(
+            source_key="mangaswat",
+            source_work_key="/series/1",
+            source_url="https://meshmanga.com/series/demo/",
+            title="Demo",
+            payload={"status": status},
+        )
+
+    assert MySqlSourceRepository._source_story_status(snapshot("ONGOING")) == "ongoing"
+    assert MySqlSourceRepository._source_story_status(snapshot("مستمرة")) == "ongoing"
+    assert MySqlSourceRepository._source_story_status(snapshot({"name": "completed"})) == "completed"
+    assert MySqlSourceRepository._source_story_status(snapshot("مكتملة")) == "completed"
+    assert MySqlSourceRepository._source_story_status(snapshot("hiatus")) == "hiatus"
+    assert MySqlSourceRepository._source_story_status(snapshot("في استراحة")) == "hiatus"
+    assert MySqlSourceRepository._source_story_status(snapshot("cancelled")) is None
+    assert MySqlSourceRepository._source_story_status(snapshot(None)) is None
