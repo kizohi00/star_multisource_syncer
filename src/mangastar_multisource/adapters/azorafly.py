@@ -10,11 +10,13 @@ from bs4 import BeautifulSoup, Tag
 
 from ..domain.errors import SourceChapterLocked
 from ..domain.models import LatestFeedSnapshot, SourceChapterSnapshot, SourcePageSnapshot, SourceWorkSnapshot
+from ..domain.status import normalize_story_status, story_status_from_payload
 from .base import (
     HtmlLatestAdapter,
     absolute_url,
     clean_html_text,
     clean_text,
+    extract_story_status,
     parse_chapter_number,
     parse_datetime,
     path_key,
@@ -78,7 +80,12 @@ class AzoraFlyAdapter(HtmlLatestAdapter):
                     cover_url=str(post.get("featuredImage") or "") or None,
                     tags=tags,
                     chapters=chapters,
-                    payload={"feed_url": self.latest_url, "page": page, "api_id": post.get("id")},
+                    payload={
+                        "feed_url": self.latest_url,
+                        "page": page,
+                        "api_id": post.get("id"),
+                        "status": story_status_from_payload(post),
+                    },
                 )
             )
             if len(works) >= limit:
@@ -132,6 +139,7 @@ class AzoraFlyAdapter(HtmlLatestAdapter):
             cover_node = soup.select_one("meta[property='og:image']")
             cover_url = cover_node.get("content") if cover_node else None
         chapters = self._fetch_full_chapter_list(soup, work_key)
+        source_status = extract_story_status(soup)
         return SourceWorkSnapshot(
             source_key=self.key,
             source_work_key=work_key,
@@ -143,6 +151,8 @@ class AzoraFlyAdapter(HtmlLatestAdapter):
             payload={
                 "detail_url": source_url,
                 "chapter_index": "api/chapters?postId=...&skip=0&take=all&order=desc",
+                "status": normalize_story_status(source_status),
+                "status_raw": source_status,
             },
         )
 

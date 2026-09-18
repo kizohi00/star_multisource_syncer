@@ -9,11 +9,13 @@ from bs4 import BeautifulSoup, Tag
 
 from ..domain.errors import SourceChapterLocked
 from ..domain.models import LatestFeedSnapshot, SourceChapterSnapshot, SourcePageSnapshot, SourceWorkSnapshot
+from ..domain.status import normalize_story_status
 from .base import (
     HtmlLatestAdapter,
     absolute_url,
     clean_html_text,
     clean_text,
+    extract_story_status,
     has_next_page,
     parse_chapter_number,
     parse_datetime,
@@ -63,6 +65,7 @@ class TeamXNovelAdapter(HtmlLatestAdapter):
             title = clean_text(card.select_one(".tt, h3")) or clean_text(card.select_one("a[href]"))
             cover = card.select_one("img[src], img[data-src], img[data-lazy-src]")
             chapters = self._parse_latest_chapters(card, work_url)
+            source_status = extract_story_status(card)
             works.append(
                 SourceWorkSnapshot(
                     source_key=self.key,
@@ -71,7 +74,13 @@ class TeamXNovelAdapter(HtmlLatestAdapter):
                     title=title,
                     cover_url=self._image_url(cover),
                     chapters=tuple(chapters),
-                    payload={"feed_url": feed_url, "page": page, "parser": "TeamXNovel"},
+                    payload={
+                        "feed_url": feed_url,
+                        "page": page,
+                        "parser": "TeamXNovel",
+                        "status": normalize_story_status(source_status),
+                        "status_raw": source_status,
+                    },
                 )
             )
             if len(works) >= limit:
@@ -141,6 +150,8 @@ class TeamXNovelAdapter(HtmlLatestAdapter):
                 "detail_url": source_url,
                 "parser": "TeamXNovel",
                 "state": state,
+                "status": normalize_story_status(state),
+                "status_raw": state,
                 "chapter_pages": max_page,
             },
         )
@@ -294,6 +305,9 @@ class TeamXNovelAdapter(HtmlLatestAdapter):
 
     @staticmethod
     def _state(soup: BeautifulSoup) -> str | None:
+        extracted = extract_story_status(soup)
+        if extracted:
+            return extracted
         for node in soup.select(".full-list-info"):
             text = clean_text(node)
             if "الحالة:" in text:

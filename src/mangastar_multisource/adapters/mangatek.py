@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from bs4 import Tag
 
 from ..domain.models import LatestFeedSnapshot, SourceChapterSnapshot, SourcePageSnapshot, SourceWorkSnapshot
+from ..domain.status import normalize_story_status
 from .base import (
     HtmlLatestAdapter,
     absolute_url,
@@ -12,6 +13,7 @@ from .base import (
     clean_text,
     extract_labeled_values,
     extract_structured_metadata,
+    extract_story_status,
     extract_tags,
     has_next_page,
     parse_chapter_number,
@@ -74,6 +76,7 @@ class MangaTekAdapter(HtmlLatestAdapter):
                 slug = work_key.split("/")[-1]
                 chapter_url = f"{self.base_url}/reader/{slug}/{chapter_number}"
                 chapters = (self._chapter(chapter_url, str(chapter_number), self.base_url),)
+            source_status = extract_story_status(card) if card else None
             works.append(
                 SourceWorkSnapshot(
                     source_key=self.key,
@@ -82,7 +85,13 @@ class MangaTekAdapter(HtmlLatestAdapter):
                     title=title,
                     cover_url=cover.get("src") if cover else None,
                     chapters=chapters,
-                    payload={"feed_url": feed_url, "page": page, "reader_pattern": "/reader/{slug}/{chapter}"},
+                    payload={
+                        "feed_url": feed_url,
+                        "page": page,
+                        "reader_pattern": "/reader/{slug}/{chapter}",
+                        "status": normalize_story_status(source_status),
+                        "status_raw": source_status,
+                    },
                 )
             )
             if len(works) >= limit:
@@ -127,6 +136,7 @@ class MangaTekAdapter(HtmlLatestAdapter):
             soup, ("author", "writer", "المؤلف", "الكاتب")
         ) or tuple(structured.get("author_names", ()))
         publisher_names = extract_labeled_values(soup, ("publisher", "الناشر"))
+        source_status = extract_story_status(soup)
         return SourceWorkSnapshot(
             source_key=self.key,
             source_work_key=work_key,
@@ -142,7 +152,11 @@ class MangaTekAdapter(HtmlLatestAdapter):
             publisher_name=(publisher_names or (str(structured.get("publisher_name")) if structured.get("publisher_name") else None,))[0],
             type_name=(extract_labeled_values(soup, ("type", "النوع")) or (None,))[0],
             chapters=tuple(chapters),
-            payload={"detail_url": source_url},
+            payload={
+                "detail_url": source_url,
+                "status": normalize_story_status(source_status),
+                "status_raw": source_status,
+            },
         )
 
     def fetch_pages(self, chapter: SourceChapterSnapshot) -> tuple[SourcePageSnapshot, ...]:

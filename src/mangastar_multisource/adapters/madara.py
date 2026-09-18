@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from bs4 import BeautifulSoup, Tag
 
 from ..domain.models import LatestFeedSnapshot, SourceChapterSnapshot, SourcePageSnapshot, SourceWorkSnapshot
+from ..domain.status import normalize_story_status
 from .base import (
     HtmlLatestAdapter,
     absolute_url,
@@ -12,6 +13,7 @@ from .base import (
     extract_labeled_values,
     extract_summary,
     extract_structured_metadata,
+    extract_story_status,
     extract_tags,
     has_next_page,
     parse_datetime,
@@ -71,6 +73,7 @@ class MadaraLatestAdapter(HtmlLatestAdapter):
                     if not self._is_chapter_url(chapter_url, work_key):
                         continue
                     chapters.append(self._chapter(chapter_url, clean_text(chapter_link), self.base_url))
+            source_status = extract_story_status(card) if card else None
             works.append(
                 SourceWorkSnapshot(
                     source_key=self.key,
@@ -79,7 +82,12 @@ class MadaraLatestAdapter(HtmlLatestAdapter):
                     title=title,
                     cover_url=cover.get("src") if cover else None,
                     chapters=tuple(chapters),
-                    payload={"feed_url": feed_url, "page": page},
+                    payload={
+                        "feed_url": feed_url,
+                        "page": page,
+                        "status": normalize_story_status(source_status),
+                        "status_raw": source_status,
+                    },
                 )
             )
             if len(works) >= limit:
@@ -129,6 +137,7 @@ class MadaraLatestAdapter(HtmlLatestAdapter):
             soup, ("author", "writer", "المؤلف", "الكاتب")
         ) or tuple(structured.get("author_names", ()))
         publisher_names = extract_labeled_values(soup, ("publisher", "الناشر"))
+        source_status = extract_story_status(soup)
         return SourceWorkSnapshot(
             source_key=self.key,
             source_work_key=work_key,
@@ -144,7 +153,11 @@ class MadaraLatestAdapter(HtmlLatestAdapter):
             publisher_name=(publisher_names or (str(structured.get("publisher_name")) if structured.get("publisher_name") else None,))[0],
             type_name=(extract_labeled_values(soup, ("type", "النوع")) or (None,))[0],
             chapters=tuple(chapters),
-            payload={"detail_url": source_url},
+            payload={
+                "detail_url": source_url,
+                "status": normalize_story_status(source_status),
+                "status_raw": source_status,
+            },
         )
 
     def fetch_pages(self, chapter: SourceChapterSnapshot) -> tuple[SourcePageSnapshot, ...]:

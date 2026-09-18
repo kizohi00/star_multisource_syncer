@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
-import unicodedata
 from collections.abc import Sequence
 
 from bs4 import BeautifulSoup
@@ -18,6 +16,7 @@ from ..domain.models import (
     SourceWorkFrontier,
     SourceWorkSnapshot,
 )
+from ..domain.status import story_status_from_payload
 from ..matching.metadata import title_similarity
 from .db import MySqlDatabase
 
@@ -264,16 +263,7 @@ class MySqlSourceRepository:
             )
         canonical_series_id = row["canonical_series_id"] or effective_match.canonical_series_id
         source_story_status = self._source_story_status(snapshot)
-        if canonical_series_id is not None and source_story_status is not None:
-            cursor.execute(
-                """
-                UPDATE series
-                SET story_status=%s
-                WHERE id=%s
-                  AND (story_status IS NULL OR story_status<>%s)
-                """,
-                (source_story_status, int(canonical_series_id), source_story_status),
-            )
+        self._update_series_story_status_cursor(cursor, canonical_series_id, source_story_status)
         return source_work_id
 
     @staticmethod
@@ -284,44 +274,26 @@ class MySqlSourceRepository:
         state in the current Manga Star schema.  ``translation_status`` is a
         legacy/unused column and must never be changed by the syncer.
         """
-        payload_status = snapshot.payload.get("status")
-        if isinstance(payload_status, dict):
-            payload_status = (
-                payload_status.get("name")
-                or payload_status.get("title")
-                or payload_status.get("label")
-                or payload_status.get("value")
-            )
-        status = unicodedata.normalize("NFKC", str(payload_status or ""))
-        status = "".join(char for char in status if not unicodedata.combining(char))
-        status = re.sub(r"[\u0640\u200e\u200f_-]+", " ", status)
-        status = " ".join(status.casefold().split())
-        aliases = {
-            "ongoing": "ongoing",
-            "on going": "ongoing",
-            "in progress": "ongoing",
-            "مستمر": "ongoing",
-            "مستمرة": "ongoing",
-            "جار": "ongoing",
-            "جاري": "ongoing",
-            "جارية": "ongoing",
-            "completed": "completed",
-            "complete": "completed",
-            "finished": "completed",
-            "مكتمل": "completed",
-            "مكتملة": "completed",
-            "منتهي": "completed",
-            "منتهية": "completed",
-            "منته": "completed",
-            "hiatus": "hiatus",
-            "paused": "hiatus",
-            "on hold": "hiatus",
-            "متوقف": "hiatus",
-            "متوقفة": "hiatus",
-            "في استراحة": "hiatus",
-            "استراحة": "hiatus",
-        }
-        return aliases.get(status)
+        return story_status_from_payload(snapshot.payload)
+
+    @staticmethod
+    def _update_series_story_status_cursor(
+        cursor,
+        canonical_series_id: object,
+        story_status: str | None,
+    ) -> None:
+        """Update only the canonical story-status column when evidence exists."""
+        if canonical_series_id is None or story_status is None:
+            return
+        cursor.execute(
+            """
+            UPDATE series
+            SET story_status=%s
+            WHERE id=%s
+              AND (story_status IS NULL OR story_status<>%s)
+            """,
+            (story_status, int(canonical_series_id), story_status),
+        )
 
     @staticmethod
     def _find_exact_title_series_cursor(cursor, title: object) -> dict | None:
@@ -1335,6 +1307,12 @@ class MySqlSourceRepository:
                         """,
                         (match.canonical_series_id, match.score, source_work_id),
                     )
+                canonical_series_id = row["canonical_series_id"] or match.canonical_series_id
+                self._update_series_story_status_cursor(
+                    cursor,
+                    canonical_series_id,
+                    self._source_story_status(snapshot),
+                )
                 return source_work_id
 
     def upsert_chapters(self, source_work_id: int, snapshot: SourceWorkSnapshot) -> int:
@@ -1810,6 +1788,11 @@ class MySqlSourceRepository:
                     )
                     if cursor.rowcount != 1:
                         raise RuntimeError("source work mapping changed during exact-title guard")
+                    self._update_series_story_status_cursor(
+                        cursor,
+                        exact_series_id,
+                        story_status_from_payload(_json_or_value(work["payload_json"])),
+                    )
                     return {
                         "status": "already_mapped",
                         "reason": "exact_title_guard",
@@ -1856,6 +1839,7 @@ class MySqlSourceRepository:
         match_score: float,
     ) -> int:
         series_id = self._allocate_series_id_cursor(cursor)
+        story_status = story_status_from_payload(_json_or_value(work["payload_json"]))
         source_payload = json.dumps(
             {
                 "managed_by": "mangastar_multisource",
@@ -1868,6 +1852,7 @@ class MySqlSourceRepository:
                 "alternative_titles": _json_or_value(work["alt_titles_json"]),
                 "tags": _json_or_value(work["tags_json"]),
                 "payload": _json_or_value(work["payload_json"]),
+                "story_status": story_status,
             },
             ensure_ascii=False,
             default=str,
@@ -1878,14 +1863,15 @@ class MySqlSourceRepository:
               (id, title, summary, cover, banner, total_chapters, rating,
                rates_count, series_views, translation_status, story_status,
                is_oneshot, over17, created_at, source_payload, scraped_at)
-            VALUES (%s, %s, %s, %s, NULL, 0, 0, 0, 0, NULL, NULL,
+            VALUES (%s, %s, %s, %s, NULL, 0, 0, 0, 0, NULL, %s,
                     0, 0, CURRENT_TIMESTAMP, %s, CURRENT_TIMESTAMP)
             """,
             (
                 series_id,
                 _bounded_text(work["title_raw"], 255),
-                 _clean_summary_for_storage(work["summary_raw"]),
+                _clean_summary_for_storage(work["summary_raw"]),
                 _bounded_text(work["cover_url"], 255),
+                story_status,
                 source_payload,
             ),
         )

@@ -8,12 +8,14 @@ import requests
 from bs4 import BeautifulSoup, Tag
 
 from ..domain.models import SourcePageSnapshot, SourceWorkSnapshot
+from ..domain.status import normalize_story_status
 from .base import (
     absolute_url,
     clean_text,
     extract_labeled_values,
     extract_summary,
     extract_structured_metadata,
+    extract_story_status,
     extract_tags,
     parse_datetime,
     response_html,
@@ -217,6 +219,7 @@ class WordPressAjaxMixin:
             soup, ("author", "writer", "المؤلف", "الكاتب")
         ) or tuple(structured.get("author_names", ()))
         publisher_names = extract_labeled_values(soup, ("publisher", "الناشر"))
+        source_status = extract_story_status(soup)
         return SourceWorkSnapshot(
             source_key=self.key,
             source_work_key=work_key,
@@ -236,6 +239,8 @@ class WordPressAjaxMixin:
                 "detail_url": source_url,
                 "source_manga_id": manga_id,
                 "chapter_index": "manga_get_chapters",
+                "status": normalize_story_status(source_status),
+                "status_raw": source_status,
             },
         )
 

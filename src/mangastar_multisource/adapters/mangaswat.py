@@ -14,6 +14,7 @@ from ..domain.models import (
     SourcePageSnapshot,
     SourceWorkSnapshot,
 )
+from ..domain.status import normalize_story_status
 from .base import (
     HtmlLatestAdapter,
     absolute_url,
@@ -652,8 +653,7 @@ class MangaSwatAdapter(HtmlLatestAdapter):
 
     @staticmethod
     def _status_name(value: object) -> str | None:
-        name = MangaSwatAdapter._named_value(value)
-        return name.casefold() if name else None
+        return normalize_story_status(value)
 
     @staticmethod
     def _named_value(value: object) -> str | None:

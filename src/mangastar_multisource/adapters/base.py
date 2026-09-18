@@ -69,9 +69,15 @@ def extract_summary(soup: BeautifulSoup) -> str:
     return ""
 
 
-def extract_labeled_values(soup: BeautifulSoup, labels: tuple[str, ...]) -> tuple[str, ...]:
+def extract_labeled_values(
+    soup: BeautifulSoup,
+    labels: tuple[str, ...],
+    *,
+    exclude_labels: tuple[str, ...] = (),
+) -> tuple[str, ...]:
     """Extract values from common Madara/WordPress labelled metadata rows."""
     wanted = tuple(label.casefold() for label in labels)
+    excluded = tuple(label.casefold() for label in exclude_labels)
     values: list[str] = []
     seen: set[str] = set()
     for item in soup.select(
@@ -81,7 +87,11 @@ def extract_labeled_values(soup: BeautifulSoup, labels: tuple[str, ...]) -> tupl
             ".summary-heading, .post-content_item-label, .summary-heading h5, .summary-heading h4, .label"
         )
         label = clean_text(label_node).casefold()
-        if not label or not any(term in label for term in wanted):
+        if (
+            not label
+            or any(term in label for term in excluded)
+            or not any(term in label for term in wanted)
+        ):
             continue
         content = item.select_one(".summary-content, .summary_content, .value, .content")
         candidates = [clean_text(node) for node in content.select("a") if clean_text(node)] if content else []
@@ -94,6 +104,61 @@ def extract_labeled_values(soup: BeautifulSoup, labels: tuple[str, ...]) -> tupl
                 seen.add(value.casefold())
                 values.append(value)
     return tuple(values)
+
+
+def extract_story_status(soup: BeautifulSoup | Tag) -> str | None:
+    """Extract a source work's status from common metadata layouts.
+
+    This returns the source spelling. The shared status normalizer is applied
+    by each adapter before the value is persisted.
+    """
+    if not soup:
+        return None
+
+    if isinstance(soup, Tag):
+        for attribute in ("data-status", "data-state"):
+            value = soup.get(attribute)
+            if value and str(value).strip():
+                return str(value).strip()
+
+    for node in soup.select("[data-status], [data-state], [itemprop='status']"):
+        for attribute in ("data-status", "data-state", "content"):
+            value = node.get(attribute)
+            if value and str(value).strip():
+                return str(value).strip()
+
+    # Team-X and a few Arabic themes render the field as plain text rather
+    # than a labelled metadata row. Prefer a child row so the value does not
+    # accidentally include the following author/type fields.
+    for node in soup.select(
+        ".full-list-info li, .full-list-info > div, .full-list-info > span, .full-list-info"
+    ):
+        text = clean_text(node)
+        match = re.search(r"(?:الحالة|status|state)\s*[:：]?\s*(.+)", text, re.IGNORECASE)
+        if not match:
+            continue
+        value = re.split(
+            r"\s+(?=(?:المؤلف|الكاتب|النوع|التصنيف|status|state|الحالة)\s*[:：])",
+            match.group(1),
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" -|،")
+        if value:
+            return value
+
+    values = extract_labeled_values(
+        soup,
+        (
+            "status",
+            "state",
+            "story status",
+            "series status",
+            "الحالة",
+            "حالة العمل",
+        ),
+        exclude_labels=("translation", "ترجمة"),
+    )
+    return values[0] if values else None
 
 
 def extract_tags(soup: BeautifulSoup) -> tuple[str, ...]:
